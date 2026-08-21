@@ -1,0 +1,80 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Test and publish package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Set up Node.js and npm authentication
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate release tag and package version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "Invalid release tag: ${tag}" >&2
+            echo "Expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease." >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          package_version="$(node -p "require('./package.json').version")"
+          if [[ "${version}" != "${package_version}" ]]; then
+            echo "Tag version ${version} does not match package.json version ${package_version}." >&2
+            exit 1
+          fi
+
+          if [[ "${version}" == *-* ]]; then
+            dist_tag="next"
+          else
+            dist_tag="latest"
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "dist_tag=${dist_tag}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing dsh-synapse@${version} with npm dist-tag ${dist_tag}."
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate JavaScript
+        run: pnpm run build
+
+      - name: Run full test suite
+        run: pnpm test
+
+      - name: Publish package
+        run: pnpm publish --access public --tag "${{ steps.release.outputs.dist_tag }}" --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
