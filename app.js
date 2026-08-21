@@ -87,9 +87,18 @@ function post(type, payload = {}) {
   if (window.parent !== window) window.parent.postMessage({ source: 'dsh-synapse', type, ...payload }, window.location.origin)
 }
 
+function uuidV4() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
+
 function dshRpc(type, payload = {}) {
   if (window.parent === window) return Promise.reject(new Error('请从 DSH 页面打开 Synapse 后再操作会话'))
-  const requestId = crypto.randomUUID()
+  const requestId = uuidV4()
   post(type, { requestId, ...payload })
   return new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => {
