@@ -713,7 +713,7 @@ function sendFile(res, contentType, body) {
 const UUID_POLYFILL = '<script>if (typeof crypto !== "undefined" && typeof crypto.randomUUID !== "function") { crypto.randomUUID = function () { return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) { var r = (Math.random() * 16) | 0; var v = c === "x" ? r : (r & 0x3) | 0x8; return v.toString(16) }) } }</script>'
 
 function page() {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Synapse for DSH</title><link rel="stylesheet" href="/synapse/styles.css">${UUID_POLYFILL}</head><body><div id="app"></div><script src="/synapse/app.js"></script></body></html>`
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Synapse for DSH</title><link rel="stylesheet" href="/synapse/styles.css">${UUID_POLYFILL}</head><body><div id="app"></div><script src="/synapse/app.js?v=2026082119"></script></body></html>`
 }
 
 /** Mount Synapse routes on the existing DSH Web Server. */
