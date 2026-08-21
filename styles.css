@@ -37,7 +37,8 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 .workspace-label { display: grid; gap: 9px; margin: 16px 4px 0; }
 .workspace-select { position: relative; display: block; }
 .workspace-select svg { position: absolute; top: 50%; left: 9px; width: 15px; height: 15px; transform: translateY(-50%); fill: none; pointer-events: none; stroke: #64748b; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.4; }
-.workspace-label select { width: 100%; min-height: 33px; border: 1px solid #d8dee8; border-radius: 6px; background: #fff; color: #374151; padding: 0 28px 0 30px; }
+.workspace-select::after { position: absolute; top: 50%; right: 10px; width: 7px; height: 7px; border-right: 1.5px solid #64748b; border-bottom: 1.5px solid #64748b; transform: translateY(-65%) rotate(45deg); content: ''; pointer-events: none; }
+.workspace-label select { width: 100%; min-height: 33px; appearance: none; -webkit-appearance: none; border: 1px solid #d8dee8; border-radius: 6px; background: #fff; color: #374151; overflow: hidden; padding: 0 30px 0 30px; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-heading { display: flex; align-items: center; justify-content: space-between; margin: 23px 4px 0; padding: 0; }
 .sidebar-heading button { display: grid; width: 24px; min-height: 24px; place-items: center; padding: 0; color: #111827; font-size: 17px; }
 .thread-tree { display: grid; gap: 3px; overflow: auto; padding-bottom: 12px; }
@@ -271,6 +272,7 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 [data-theme="dark"] .workspace-label, [data-theme="dark"] .sidebar-heading { color: #8f959e; }
 [data-theme="dark"] .workspace-label select { border-color: #2a2d33; background: #15171b; color: #e6e8eb; }
 [data-theme="dark"] .workspace-select svg { stroke: #8f959e; }
+[data-theme="dark"] .workspace-select::after { border-color: #8f959e; }
 [data-theme="dark"] .tree-row { color: #a7adb5; }
 [data-theme="dark"] .tree-row:hover { background: #26282d; }
 [data-theme="dark"] .tree-row.active { background: #2a2d33; color: #e6e8eb; }
