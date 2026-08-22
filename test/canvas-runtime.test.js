@@ -228,3 +228,182 @@ test('prunes persisted collapsed state when a conversation is archived', async (
   assert.match(archive, /key\.startsWith\(`\$\{id\}:`\)/)
   assert.match(archive, /persistCollapsedCards\(\)/)
 })
+
+test('layout button automatically repairs broken parent-child connections', async () => {
+  const app = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+
+  // Button triggers connection repair before resetting positions and re-rendering
+  assert.match(app, /if \(button\.dataset\.action === 'layout' && state\.workspace !== null\)/)
+  assert.match(app, /await repairWorkspaceSessionConnections\(\)/)
+  assert.match(app, /async function repairWorkspaceSessionConnections\(\)/)
+
+  // Test the repair function logic with VM
+  const vm = await import('node:vm')
+  const context = {
+    globalThis: {},
+    state: {
+      workspace: {
+        id: 'w1',
+        title: '工作区',
+        threads: [
+          { id: 'parent-1', title: '父会话', parentId: null, messages: [{ kind: 'user', text: '你好', sourceSeq: 1 }, { kind: 'assistant', text: '你好！', sourceSeq: 2 }] },
+          { id: 'child-1', title: '子分支1', parentId: 'wrong-id', messages: [{ kind: 'user', text: '你好', sourceSeq: 1 }, { kind: 'assistant', text: '你好！', sourceSeq: 2 }, { kind: 'user', text: '分支1问题', sourceSeq: 3 }] },
+          { id: 'child-2', title: '子分支2', parentId: null, messages: [{ kind: 'user', text: '你好', sourceSeq: 1 }, { kind: 'assistant', text: '你好！', sourceSeq: 2 }, { kind: 'user', text: '分支2问题', sourceSeq: 4 }] },
+          { id: 'isolated-3', title: '独立话题', parentId: 'parent-1', messages: [{ kind: 'user', text: '今天天气', sourceSeq: 1 }, { kind: 'assistant', text: '晴天', sourceSeq: 2 }] },
+        ],
+      },
+      cardPositions: new Map(),
+      branchAnchors: new Map(),
+    },
+  }
+  vm.createContext(context)
+
+  const fnStart = app.indexOf('function normalizeTurnText')
+  const fnEnd = app.indexOf('function persistCardPositions()')
+  const fnCode = app.slice(fnStart, fnEnd)
+
+  vm.runInContext(`${fnCode}; globalThis.repair = repairWorkspaceSessionConnections`, context)
+  const changed = await context.globalThis.repair()
+
+  assert.equal(changed, true)
+  const threads = context.state.workspace.threads
+  // child-1 repaired from wrong-id to parent-1 based on context prefix
+  assert.equal(threads.find(t => t.id === 'child-1').parentId, 'parent-1')
+  assert.equal(threads.find(t => t.id === 'child-1').sourceSeedLength, 3)
+  assert.equal(context.state.branchAnchors.get('child-1'), 'parent-1:turn:1')
+
+  // child-2 linked to parent-1 based on context prefix
+  assert.equal(threads.find(t => t.id === 'child-2').parentId, 'parent-1')
+  assert.equal(threads.find(t => t.id === 'child-2').sourceSeedLength, 4)
+  assert.equal(context.state.branchAnchors.get('child-2'), 'parent-1:turn:1')
+
+  // isolated-3 has no shared turns with parent-1 -> disconnected to root
+  assert.equal(threads.find(t => t.id === 'isolated-3').parentId, null)
+  assert.equal(threads.find(t => t.id === 'isolated-3').sourceSeedLength, null)
+  assert.equal(context.state.branchAnchors.has('isolated-3'), false)
+})
+
+test('renders and persists card notes and opens context menu on right click', async () => {
+  const app = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const styles = await readFile(new URL('../styles.css', import.meta.url), 'utf8')
+
+  // Context menu on right click
+  assert.match(app, /app\.addEventListener\('contextmenu',/)
+  assert.match(app, /renderContextMenu\(\)/)
+  assert.match(styles, /\.synapse-context-menu/)
+
+  // Card note persistence and display
+  assert.match(app, /const CARD_NOTES_KEY = 'dsh-synapse:card-notes:v1'/)
+  assert.match(app, /function rememberCardNote\(cardId, note\)/)
+  assert.match(app, /function removeCardNote\(cardId\)/)
+  assert.match(app, /class="thread-card-note"/)
+  assert.match(styles, /\.thread-card-note/)
+
+  // Note modal dialog
+  assert.match(app, /function renderNoteModal\(\)/)
+  assert.match(app, /data-note-form/)
+  assert.match(styles, /\.note-modal/)
+})
+
+test('builds maximum spanning tree for multi-level deep branches and sibling forks', async () => {
+  const app = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const vm = await import('node:vm')
+
+  const context = {
+    globalThis: {},
+    state: {
+      workspace: {
+        id: 'w1',
+        title: '工作区',
+        threads: [
+          {
+            id: 'trunk',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            parentId: null,
+            messages: Array.from({ length: 15 }, (_, i) => ({ kind: 'user', text: `Q${i + 1}`, sourceSeq: (i + 1) * 2 - 1 })),
+          },
+          {
+            id: 'branchA',
+            createdAt: '2026-01-01T00:10:00.000Z',
+            parentId: null,
+            messages: [
+              ...Array.from({ length: 10 }, (_, i) => ({ kind: 'user', text: `Q${i + 1}`, sourceSeq: (i + 1) * 2 - 1 })),
+              ...Array.from({ length: 8 }, (_, i) => ({ kind: 'user', text: `QA${i + 11}`, sourceSeq: 100 + (i + 11) * 2 - 1 })),
+            ],
+          },
+          {
+            id: 'deepBranchB',
+            createdAt: '2026-01-01T00:20:00.000Z',
+            parentId: null,
+            messages: [
+              ...Array.from({ length: 10 }, (_, i) => ({ kind: 'user', text: `Q${i + 1}`, sourceSeq: (i + 1) * 2 - 1 })),
+              ...Array.from({ length: 4 }, (_, i) => ({ kind: 'user', text: `QA${i + 11}`, sourceSeq: 100 + (i + 11) * 2 - 1 })),
+              ...Array.from({ length: 6 }, (_, i) => ({ kind: 'user', text: `QB${i + 15}`, sourceSeq: 200 + (i + 15) * 2 - 1 })),
+            ],
+          },
+          {
+            id: 'siblingBranchC',
+            createdAt: '2026-01-01T00:15:00.000Z',
+            parentId: null,
+            messages: [
+              ...Array.from({ length: 10 }, (_, i) => ({ kind: 'user', text: `Q${i + 1}`, sourceSeq: (i + 1) * 2 - 1 })),
+              ...Array.from({ length: 3 }, (_, i) => ({ kind: 'user', text: `QC${i + 11}`, sourceSeq: 300 + (i + 11) * 2 - 1 })),
+            ],
+          },
+        ],
+      },
+      cardPositions: new Map(),
+      branchAnchors: new Map(),
+    },
+  }
+  vm.createContext(context)
+
+  const fnStart = app.indexOf('function normalizeTurnText')
+  const fnEnd = app.indexOf('function persistCardPositions()')
+  const fnCode = app.slice(fnStart, fnEnd)
+
+  vm.runInContext(`${fnCode}; globalThis.repair = repairWorkspaceSessionConnections`, context)
+  await context.globalThis.repair()
+
+  const threads = context.state.workspace.threads
+  // trunk is root
+  assert.equal(threads.find(t => t.id === 'trunk').parentId, null)
+
+  // branchA forks from trunk at Turn 10 (sourceSeq: 19)
+  assert.equal(threads.find(t => t.id === 'branchA').parentId, 'trunk')
+  assert.equal(context.state.branchAnchors.get('branchA'), 'trunk:turn:19')
+  assert.equal(threads.find(t => t.id === 'branchA').sourceSeedLength, 121)
+
+  // deepBranchB forks from branchA at Turn 14 (QA14 -> sourceSeq: 127)
+  assert.equal(threads.find(t => t.id === 'deepBranchB').parentId, 'branchA')
+  assert.equal(context.state.branchAnchors.get('deepBranchB'), 'branchA:turn:127')
+  assert.equal(threads.find(t => t.id === 'deepBranchB').sourceSeedLength, 229)
+
+  // siblingBranchC forks from trunk at Turn 10 (sourceSeq: 19)
+  assert.equal(threads.find(t => t.id === 'siblingBranchC').parentId, 'trunk')
+  assert.equal(context.state.branchAnchors.get('siblingBranchC'), 'trunk:turn:19')
+  assert.equal(threads.find(t => t.id === 'siblingBranchC').sourceSeedLength, 321)
+})
+
+test('renders canvas minimap navigator with interactive viewport bounding', async () => {
+  const app = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const styles = await readFile(new URL('../styles.css', import.meta.url), 'utf8')
+
+  // Minimap structure and functions
+  assert.match(app, /function renderMinimap/)
+  assert.match(app, /function getMinimapMetrics/)
+  assert.match(app, /function panCameraToMinimapPoint/)
+  assert.match(app, /function updateMinimapViewfinder/)
+  assert.match(app, /data-minimap-stage/)
+  assert.match(app, /class="minimap-viewfinder"/)
+
+  // Minimap styles
+  assert.match(styles, /\.synapse-minimap/)
+  assert.match(styles, /\.minimap-stage/)
+  assert.match(styles, /\.minimap-viewfinder/)
+  assert.match(styles, /\.minimap-node/)
+
+  // Minimap pointer and toggle interactions
+  assert.match(app, /data-minimap-stage/)
+  assert.match(app, /data-action="toggle-minimap"/)
+})
