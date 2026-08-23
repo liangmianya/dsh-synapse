@@ -7,7 +7,7 @@ async function loadConversationCards() {
   const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
   const start = source.indexOf('function overlapsCard')
   const end = source.indexOf('function canvasConnectors')
-  const context = { globalThis: {}, CARD_WIDTH: 310, CARD_HEIGHT: 276, CARD_GAP_Y: 42, CAMERA_INSET_X: 56, CAMERA_INSET_Y: 56, messagesFor: thread => thread.messages, state: { branchAnchors: new Map(), cardPositions: new Map(), liveReplies: new Map(), collapsedCardIds: new Set() } }
+  const context = { globalThis: {}, CARD_WIDTH: 310, CARD_HEIGHT: 276, CARD_GAP_Y: 42, CAMERA_INSET_X: 56, CAMERA_INSET_Y: 56, messagesFor: thread => thread.messages, state: { branchAnchors: new Map(), cardPositions: new Map(), liveReplies: new Map(), collapsedCardIds: new Set(), hiddenCardIds: new Set() } }
   vm.createContext(context)
   vm.runInContext(`${source.slice(start, end)};globalThis.conversationCards = conversationCards;globalThis.conversationGraphView = conversationGraphView;globalThis.initialCanvasCamera = initialCanvasCamera`, context)
   return { conversationCards: context.globalThis.conversationCards, conversationGraphView: context.globalThis.conversationGraphView, initialCanvasCamera: context.globalThis.initialCanvasCamera, state: context.state }
@@ -355,4 +355,156 @@ test('cyclic collapsed roots stay visible and count unique descendants', async (
   assert.deepEqual(Array.from(graph.cards, card => card.id), ['a', 'b'])
   assert.equal(graph.descendantCounts.get('a'), 1)
   assert.equal(graph.descendantCounts.get('b'), 1)
+})
+
+test('mounts a re-parented thread at the exact dropped turn via its anchor sequence', async () => {
+  const { conversationCards } = await loadConversationCards()
+  const cards = conversationCards([
+    {
+      id: 'parent', parentId: null, position: { x: 86, y: 82 },
+      messages: [
+        { kind: 'user', text: '第一轮', sourceSeq: 1 },
+        { kind: 'assistant', text: '第一轮回答', sourceSeq: 2 },
+        { kind: 'user', text: '第二轮', sourceSeq: 5 },
+        { kind: 'assistant', text: '第二轮回答', sourceSeq: 6 },
+        { kind: 'user', text: '第三轮', sourceSeq: 9 },
+        { kind: 'assistant', text: '第三轮回答', sourceSeq: 10 },
+      ],
+    },
+    {
+      id: 'child', parentId: 'parent', anchorSeq: 5, sourceSeedLength: 999, position: { x: 86, y: 900 },
+      messages: [
+        { kind: 'user', text: '重挂载分支', sourceSeq: 12 },
+        { kind: 'assistant', text: '分支回答', sourceSeq: 13 },
+      ],
+    },
+  ])
+
+  const parentTurns = cards.filter(card => card.dshThreadId === 'parent')
+  const childTurn = cards.find(card => card.dshThreadId === 'child')
+  // The stale seed boundary must not win: the anchor lands on the dropped turn.
+  assert.equal(childTurn.parentId, parentTurns[1].id)
+})
+
+test('attaches a re-parented thread after the latest parent turn when its anchor turn is gone', async () => {
+  const { conversationCards } = await loadConversationCards()
+  const cards = conversationCards([
+    {
+      id: 'parent', parentId: null, position: { x: 86, y: 82 },
+      messages: [
+        { kind: 'user', text: '第一轮', sourceSeq: 1 },
+        { kind: 'assistant', text: '第一轮回答', sourceSeq: 2 },
+        { kind: 'user', text: '第二轮', sourceSeq: 5 },
+        { kind: 'assistant', text: '第二轮回答', sourceSeq: 6 },
+      ],
+    },
+    {
+      id: 'child', parentId: 'parent', anchorSeq: 77, sourceSeedLength: 3, position: { x: 86, y: 900 },
+      messages: [
+        { kind: 'user', text: '锚点已消失的分支', sourceSeq: 9 },
+        { kind: 'assistant', text: '分支回答', sourceSeq: 10 },
+      ],
+    },
+  ])
+
+  const parentTurns = cards.filter(card => card.dshThreadId === 'parent')
+  const childTurn = cards.find(card => card.dshThreadId === 'child')
+  assert.equal(childTurn.parentId, parentTurns[1].id)
+})
+
+test('removes a hidden turn from the map and stitches its child to the visible ancestor', async () => {
+  const { conversationCards, conversationGraphView, state } = await loadConversationCards()
+  const cards = conversationCards([{
+    id: 'session-1', parentId: null, position: { x: 86, y: 82 },
+    messages: [
+      { kind: 'user', text: '第一轮', sourceSeq: 1 },
+      { kind: 'assistant', text: '回答一', sourceSeq: 2 },
+      { kind: 'user', text: '第二轮', sourceSeq: 3 },
+      { kind: 'assistant', text: '回答二', sourceSeq: 4 },
+      { kind: 'user', text: '第三轮', sourceSeq: 5 },
+      { kind: 'assistant', text: '回答三', sourceSeq: 6 },
+    ],
+  }])
+  state.hiddenCardIds.add(cards[1].id)
+
+  const graph = conversationGraphView(cards)
+  assert.deepEqual(Array.from(graph.cards, card => card.question), ['第一轮', '第三轮'])
+  // The surviving turn re-links to the visible ancestor, not the removed one.
+  assert.equal(graph.cards[1].parentId, cards[0].id)
+  assert.equal(graph.childCounts.get(cards[0].id), 1)
+})
+
+test('removing a branch anchor still shows the branch stitched to its visible ancestor', async () => {
+  const { conversationCards, conversationGraphView, state } = await loadConversationCards()
+  const cards = conversationCards([
+    {
+      id: 'parent', parentId: null,
+      messages: [
+        { kind: 'user', text: '第一轮', sourceSeq: 1 },
+        { kind: 'assistant', text: '回答一', sourceSeq: 2 },
+        { kind: 'user', text: '第二轮', sourceSeq: 5 },
+        { kind: 'assistant', text: '回答二', sourceSeq: 6 },
+      ],
+    },
+    {
+      id: 'child', parentId: 'parent', anchorSeq: 5, sourceSeedLength: 4,
+      messages: [
+        { kind: 'user', text: '分支问题', sourceSeq: 7 },
+        { kind: 'assistant', text: '分支回答', sourceSeq: 8 },
+      ],
+    },
+  ])
+  const anchorTurn = cards.find(card => card.dshThreadId === 'parent' && card.turnIndex === 1)
+  state.hiddenCardIds.add(anchorTurn.id)
+
+  const graph = conversationGraphView(cards)
+  const childCard = graph.cards.find(card => card.dshThreadId === 'child')
+  const firstParentTurn = graph.cards.find(card => card.dshThreadId === 'parent')
+  assert.ok(childCard !== undefined)
+  // The anchored turn is gone; the branch hangs off the nearest visible ancestor.
+  assert.equal(childCard.parentId, firstParentTurn.id)
+})
+
+test('moves the continue affordance to the last visible turn when the tail is removed', async () => {
+  const { conversationCards, state } = await loadConversationCards()
+  // The tail turn's card id is derived from its source sequence.
+  state.hiddenCardIds.add('session-1:turn:3')
+  const cards = conversationCards([{
+    id: 'session-1', parentId: null,
+    messages: [
+      { kind: 'user', text: '第一轮', sourceSeq: 1 },
+      { kind: 'assistant', text: '回答一', sourceSeq: 2 },
+      { kind: 'user', text: '第二轮', sourceSeq: 3 },
+      { kind: 'assistant', text: '回答二', sourceSeq: 4 },
+    ],
+  }])
+
+  assert.equal(cards[0].canContinue, true)
+  assert.equal(cards[1].canContinue, undefined)
+})
+
+test('leaves fork lineage untouched when no anchor sequence is present', async () => {
+  const { conversationCards, state } = await loadConversationCards()
+  state.hiddenCardIds.clear()
+  const cards = conversationCards([
+    {
+      id: 'parent', parentId: null, position: { x: 86, y: 82 },
+      messages: [
+        { kind: 'user', text: '第一轮', sourceSeq: 1 },
+        { kind: 'assistant', text: '第一轮回答', sourceSeq: 2 },
+        { kind: 'user', text: '第二轮', sourceSeq: 5 },
+        { kind: 'assistant', text: '第二轮回答', sourceSeq: 6 },
+      ],
+    },
+    {
+      id: 'child', parentId: 'parent', sourceSeedLength: 7, position: { x: 999, y: 999 },
+      messages: [
+        { kind: 'user', text: '分支问题', sourceSeq: 7 },
+        { kind: 'assistant', text: '分支回答', sourceSeq: 8 },
+      ],
+    },
+  ])
+
+  const childTurn = cards.find(card => card.dshThreadId === 'child')
+  assert.equal(childTurn.parentId, cards.find(card => card.dshThreadId === 'parent' && card.turnIndex === 1).id)
 })

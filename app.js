@@ -3,6 +3,7 @@ if ('scrollRestoration' in history) history.scrollRestoration = 'manual'
 const LEGACY_CARD_POSITIONS_KEY = 'dsh-synapse:card-positions'
 const CARD_POSITIONS_KEY = 'dsh-synapse:card-positions:v3'
 const COLLAPSED_CARDS_KEY = 'dsh-synapse:collapsed-cards:v1'
+const HIDDEN_CARDS_KEY = 'dsh-synapse:hidden-cards:v1'
 const savedBranchAnchors = (() => {
   try {
     const value = JSON.parse(localStorage.getItem('dsh-synapse:branch-anchors') ?? '[]')
@@ -24,6 +25,12 @@ const savedCollapsedCards = (() => {
     return Array.isArray(value) ? value.filter(item => typeof item === 'string') : []
   } catch { return [] }
 })()
+const savedHiddenCards = (() => {
+  try {
+    const value = JSON.parse(localStorage.getItem(HIDDEN_CARDS_KEY) ?? '[]')
+    return Array.isArray(value) ? value.filter(item => typeof item === 'string') : []
+  } catch { return [] }
+})()
 const CARD_WIDTH = 310
 const CARD_HEIGHT = 276
 const CARD_GAP_Y = 42
@@ -33,7 +40,7 @@ const state = {
   summaries: [], workspace: null, activeId: null, mode: 'canvas', zoom: 1, currentDsh: null, sidebarCollapsed: false,
   dshWorkspaces: [], selectedDshWorkspaceId: null,
   historyBySession: new Map(), historyRequests: new Map(), pendingReplies: new Map(), pendingRpc: new Map(), liveReplies: new Map(),
-  draft: null, error: '', workspaceLoad: 0, branchAnchors: new Map(savedBranchAnchors), cardPositions: new Map(savedCardPositions), collapsedCardIds: new Set(savedCollapsedCards),
+  draft: null, error: '', workspaceLoad: 0, branchAnchors: new Map(savedBranchAnchors), cardPositions: new Map(savedCardPositions), collapsedCardIds: new Set(savedCollapsedCards), hiddenCardIds: new Set(savedHiddenCards), hiddenCardsOpen: false,
   dragging: false, canvasGesture: false, canvasRefreshAfter: 0, canvasViewInitialized: false, canvasCamera: { x: 0, y: 0 },
   expandedMessageIds: new Set(),
 }
@@ -54,6 +61,10 @@ function persistCardPositions() {
 
 function persistCollapsedCards() {
   try { localStorage.setItem(COLLAPSED_CARDS_KEY, JSON.stringify([...state.collapsedCardIds])) } catch { /* Private browsing may disable local storage. */ }
+}
+
+function persistHiddenCards() {
+  try { localStorage.setItem(HIDDEN_CARDS_KEY, JSON.stringify([...state.hiddenCardIds])) } catch { /* Private browsing may disable local storage. */ }
 }
 
 function rememberCardPosition(cardId, position, aliases = []) {
@@ -170,7 +181,7 @@ async function openDshWorkspace(id, { renderAfter = true } = {}) {
   state.workspace = { id: nextWorkspaceId, title: workspace.title, cwd: workspace.path, threads }
   const currentThread = currentDshThread(state.workspace.threads)
   state.activeId = currentThread?.id ?? (state.workspace.threads.some(thread => thread.id === state.activeId) ? state.activeId : state.workspace.threads[0]?.id ?? null)
-  if (currentThread !== undefined) revealConversationThread(conversationCards(state.workspace.threads), currentThread.id)
+  if (currentThread !== undefined) revealThreadPresence(currentThread.id)
   if (renderAfter && canReplaceView()) render()
   await Promise.all(state.workspace.threads.map(thread => loadThreadHistory(thread, false)))
   if (renderAfter && load === state.workspaceLoad && canReplaceView()) render()
@@ -255,6 +266,14 @@ async function archiveThread(thread) {
       }
     }
     if (collapsedChanged) persistCollapsedCards()
+    let hiddenChanged = false
+    for (const key of [...state.hiddenCardIds]) {
+      if ([...removed].some(id => key.startsWith(`${id}:`))) {
+        state.hiddenCardIds.delete(key)
+        hiddenChanged = true
+      }
+    }
+    if (hiddenChanged) persistHiddenCards()
     state.activeId = state.activeId !== null && state.workspace.threads.some(item => item.id === state.activeId)
       ? state.activeId
       : state.workspace.threads[0]?.id ?? null
@@ -324,8 +343,10 @@ async function submitDraft() {
       return
     }
     const session = await dshRpc('synapse:fork-session', { sessionId: parent.dshSessionId, atSeq: draft.atSeq })
-    if (draft.anchorId !== undefined) rememberBranchAnchor(session.id, draft.anchorId)
     const result = await api(`/synapse/api/threads/${parent.id}/branch`, { method: 'POST', body: JSON.stringify({ title: text.slice(0, 42), dshSessionId: session.id, dshSessionTitle: session.title, position: branchPosition }) })
+    // Anchor keyed by the canvas thread id: conversationCards looks anchors up
+    // by `card.dshThreadId`, not by the DSH session id.
+    if (draft.anchorId !== undefined) rememberBranchAnchor(result.thread.id, draft.anchorId)
     if (state.workspace !== null && !state.workspace.threads.some(thread => thread.id === result.thread.id || thread.dshSessionId === result.thread.dshSessionId)) state.workspace.threads.push(result.thread)
     state.activeId = result.thread.id
     state.draft = null
@@ -651,7 +672,11 @@ function conversationCards(threads) {
       answer: null,
       })
     }
-    turns.at(-1).canContinue = true
+    // The continue affordance belongs on the last turn still shown on the map:
+    // a removed tail turn stays intact in the conversation but must not keep
+    // the "add follow-up" button away from the visible tail.
+    const lastVisibleTurn = [...turns].reverse().find(turn => !state.hiddenCardIds.has(turn.id))
+    if (lastVisibleTurn !== undefined) lastVisibleTurn.canContinue = true
     cardsByThread.set(thread.id, turns)
     cards.push(...turns)
   }
@@ -669,16 +694,38 @@ function conversationCards(threads) {
       const inheritedTurn = Number.isSafeInteger(seedLength)
         ? parentCards?.filter(candidate => Number.isInteger(candidate.sourceSeq) && candidate.sourceSeq < seedLength).at(-1)
         : undefined
-      card.parentId = state.branchAnchors.get(card.dshThreadId) ?? inheritedTurn?.id ?? null
+      // A re-mounted thread keeps `anchorSeq` on the server: attach its head to
+      // the exact dropped card, or to the parent's latest turn as a fallback.
+      const reanchored = sourceThread !== undefined && 'anchorSeq' in sourceThread
+      const anchoredTurn = reanchored && parentCards !== undefined
+        ? parentCards.find(candidate => Number.isSafeInteger(sourceThread.anchorSeq) && candidate.sourceSeq === sourceThread.anchorSeq) ?? parentCards.at(-1)
+        : undefined
+      card.parentId = state.branchAnchors.get(card.dshThreadId) ?? anchoredTurn?.id ?? inheritedTurn?.id ?? null
     }
   }
   return layoutConversationGraph(cards, threads)
 }
 
-function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds) {
+function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds, hiddenCardIds = state.hiddenCardIds) {
   const cardIds = new Set(cards.map(card => card.id))
+  const byId = new Map(cards.map(card => [card.id, card]))
+  // A removed turn stays in the conversation but leaves the map. Stitch its
+  // children to the nearest visible ancestor so the visible chain never breaks.
+  const effectiveParent = card => {
+    const visited = new Set()
+    let parentId = card.parentId
+    while (parentId !== null && !visited.has(parentId)) {
+      visited.add(parentId)
+      if (!hiddenCardIds.has(parentId)) return parentId
+      parentId = byId.get(parentId)?.parentId ?? null
+    }
+    return null
+  }
+  const visibleCards = cards
+    .filter(card => !hiddenCardIds.has(card.id))
+    .map(card => effectiveParent(card) === card.parentId ? card : { ...card, parentId: effectiveParent(card) })
   const childrenByParent = new Map()
-  for (const card of cards) {
+  for (const card of visibleCards) {
     if (card.parentId === null || !cardIds.has(card.parentId)) continue
     const children = childrenByParent.get(card.parentId) ?? []
     children.push(card.id)
@@ -687,7 +734,7 @@ function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds)
 
   const hiddenIds = new Set()
   for (const rootId of collapsedCardIds) {
-    if (!cardIds.has(rootId)) continue
+    if (!cardIds.has(rootId) || hiddenCardIds.has(rootId)) continue
     const visited = new Set([rootId])
     const visit = parentId => {
       for (const childId of childrenByParent.get(parentId) ?? []) {
@@ -705,7 +752,7 @@ function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds)
   for (const rootId of collapsedCardIds) hiddenIds.delete(rootId)
 
   const descendantCounts = new Map()
-  for (const card of cards) {
+  for (const card of visibleCards) {
     const visited = new Set([card.id])
     const pending = [...(childrenByParent.get(card.id) ?? [])]
     while (pending.length > 0) {
@@ -718,8 +765,8 @@ function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds)
   }
 
   return {
-    cards: cards.filter(card => !hiddenIds.has(card.id)),
-    childCounts: new Map(cards.map(card => [card.id, childrenByParent.get(card.id)?.length ?? 0])),
+    cards: visibleCards.filter(card => !hiddenIds.has(card.id)),
+    childCounts: new Map(visibleCards.map(card => [card.id, childrenByParent.get(card.id)?.length ?? 0])),
     descendantCounts,
   }
 }
@@ -753,6 +800,24 @@ function canvasConnectors(cards) {
   return links.join('')
 }
 
+/**
+ * Selecting a conversation must always surface it on the map: expand its
+ * collapsed ancestor path and, when every turn of the thread was removed,
+ * restore the removed turns. A thread with at least one visible turn keeps
+ * the user's deliberate per-turn removals.
+ */
+function revealThreadPresence(threadId) {
+  if (state.workspace === null) return
+  const allCards = conversationCards(state.workspace.threads)
+  revealConversationThread(allCards, threadId)
+  const threadCards = allCards.filter(card => card.dshThreadId === threadId)
+  if (threadCards.length === 0) return
+  const graph = conversationGraphView(allCards)
+  if (graph.cards.some(card => card.dshThreadId === threadId)) return
+  for (const card of threadCards) state.hiddenCardIds.delete(card.id)
+  persistHiddenCards()
+}
+
 function conversationCard(card, graph) {
   const active = card.dshThreadId === state.activeId ? 'active' : ''
   const source = card.parentId === null ? 'DSH 会话' : card.turnIndex === 0 ? 'DSH 分支' : '追问'
@@ -764,13 +829,14 @@ function conversationCard(card, graph) {
   const foldLabel = collapsed ? '展开后续对话' : '折叠后续对话'
   const foldButton = childCount === 0 || card.canContinue === true ? '' : `<button class="graph-fold-button${collapsed ? ' collapsed' : ''}" data-action="toggle-card-children" data-card="${escapeHtml(card.id)}" aria-expanded="${collapsed ? 'false' : 'true'}" aria-label="${foldLabel}" title="${foldLabel}"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3.5 8h9"/>${collapsed ? '<path d="M8 3.5v9"/>' : ''}</svg></button>`
   const branchButton = childCount === 0 || card.canContinue === true || !Number.isInteger(card.answer?.sourceSeq) ? '' : `<button class="graph-branch-button" data-action="open-branch" data-thread="${card.dshThreadId}" data-card="${escapeHtml(card.id)}" data-seq="${card.answer.sourceSeq}" aria-label="在新对话中分支" title="在新对话中分支"><svg aria-hidden="true" viewBox="0 0 16 16"><path fill-rule="evenodd" clip-rule="evenodd" d="M13.0762 1.37207C14.0846 1.37228 14.9021 2.19077 14.9023 3.19922C14.9022 4.20772 14.0847 5.02518 13.0762 5.02539C12.2967 5.02539 11.6325 4.53691 11.3701 3.84961H4.35547C4.79397 4.26458 5.15861 4.7644 5.41699 5.33496L7.10645 9.06738C7.88526 10.7875 9.55104 11.9228 11.4189 12.0371C11.7085 11.4109 12.3411 10.9756 13.0762 10.9756C14.0843 10.9759 14.9023 11.7936 14.9023 12.8018C14.9023 13.81 14.0843 14.6277 13.0762 14.6279C12.2534 14.6279 11.5574 14.0832 11.3291 13.335C8.9868 13.1879 6.89981 11.7612 5.92285 9.60352L4.23242 5.87109C3.67503 4.64033 2.44878 3.84961 1.09766 3.84961V2.54883C1.10665 2.54883 1.11601 2.54975 1.125 2.5498L11.3701 2.54883C11.6326 1.86151 12.2969 1.37207 13.0762 1.37207ZM13.0762 12.2764C12.7858 12.2764 12.5508 12.5114 12.5508 12.8018C12.5508 13.0921 12.7858 13.3281 13.0762 13.3281C13.3664 13.3279 13.6025 13.092 13.6025 12.8018C13.6025 12.5115 13.3664 12.2766 13.0762 12.2764ZM13.0762 2.67285C12.7855 2.67285 12.55 2.90861 12.5498 3.19922C12.5499 3.48987 12.7855 3.72559 13.0762 3.72559C13.3667 3.72538 13.6024 3.48975 13.6025 3.19922C13.6023 2.90874 13.3666 2.67306 13.0762 2.67285Z" fill="currentColor"/></svg></button>`
-  return `<article class="thread-card ${active}" data-card-id="${escapeHtml(card.id)}" data-position-key="${escapeHtml(card.positionKey)}" data-thread="${card.dshThreadId}" style="left:${card.position.x}px;top:${card.position.y}px;--thread-color:#3478f6">
-    <button class="node-handle" data-drag-card="${card.id}" aria-label="拖动 ${escapeHtml(card.question)}" title="拖动卡片"></button>
+  const handleTitle = card.turnIndex === 0 ? '拖动整条分支；松手到另一张卡片上可挂载到该分支' : '拖动卡片及其后续对话'
+  return `<article class="thread-card ${active}" data-card-id="${escapeHtml(card.id)}" data-position-key="${escapeHtml(card.positionKey)}" data-thread="${card.dshThreadId}" data-turn-index="${card.turnIndex}" style="left:${card.position.x}px;top:${card.position.y}px;--thread-color:#3478f6">
+    <button class="node-handle" data-drag-card="${card.id}" aria-label="拖动 ${escapeHtml(card.question)}" title="${handleTitle}"></button>
     ${continueButton}${foldButton}${branchButton}
     <div class="thread-card-head"><span class="topic-dot"></span><button class="thread-title" data-action="show-thread" data-thread="${card.dshThreadId}" title="查看完整会话：${escapeHtml(card.question)}">${escapeHtml(card.question)}</button></div>
     <div class="thread-meta"><span>${source}</span><span>第 ${card.turnIndex + 1} 轮</span></div>
     <div class="thread-answer">${card.answer === null ? '<p class="thread-answer-empty">等待助手回复</p>' : card.answer.pending && card.answer.text === '' ? '<p class="thread-answer-pending">正在回复</p>' : `${renderMarkdown(card.answer.text)}${card.answer.pending ? '<p class="thread-answer-pending">正在回复</p>' : ''}`}</div>
-    <footer><button data-action="show-thread" data-thread="${card.dshThreadId}">详情</button><button data-action="open-dsh" data-thread="${card.dshThreadId}">打开 DSH</button><button data-action="archive-thread" data-thread="${card.dshThreadId}">归档</button></footer>
+    <footer><button data-action="show-thread" data-thread="${card.dshThreadId}">详情</button><button data-action="open-dsh" data-thread="${card.dshThreadId}">打开 DSH</button><button data-action="hide-card" data-card="${escapeHtml(card.id)}" title="仅从会话地图移除该对话块，原会话完整保留">移除</button><button data-action="archive-thread" data-thread="${card.dshThreadId}">归档</button></footer>
   </article>`
 }
 
@@ -810,6 +876,10 @@ function renderCanvas() {
   const allCards = conversationCards(threads)
   const graph = conversationGraphView(allCards)
   const cards = graph.cards
+  if (cards.length === 0 && state.draft === null) {
+    const restoreAll = state.hiddenCardIds.size > 0 ? '<div><button class="primary" type="button" data-action="restore-all-hidden">恢复全部对话块</button></div>' : ''
+    return `<section class="empty-canvas"><strong>画布上没有可见的对话块。</strong><p>已移除的对话块与折叠的后续对话都完整保留在原会话中，可随时恢复显示。</p>${restoreAll}</section>`
+  }
   if (!state.canvasViewInitialized) {
     state.canvasCamera = initialCanvasCamera(cards)
     state.canvasViewInitialized = true
@@ -882,10 +952,14 @@ function render() {
   const view = state.mode === 'thread' ? renderThread() : renderCanvas()
   const choices = workspaceChoices()
   const selectedWorkspaceId = state.selectedDshWorkspaceId ?? workspace?.id
-  const canvasControls = state.mode === 'canvas' && (threads.length > 0 || state.draft?.kind === 'new') ? `<div class="canvas-controls"><button data-action="layout">整理节点</button><button data-action="focus-active" title="定位到当前会话">定位</button><button data-action="zoom-out" aria-label="缩小">-</button><span>${Math.round(state.zoom * 100)}%</span><button data-action="zoom-in" aria-label="放大">+</button></div>` : ''
+  const canvasControls = state.mode === 'canvas' && (threads.length > 0 || state.draft?.kind === 'new') ? `<div class="canvas-controls"><button data-action="layout">整理节点</button><button data-action="focus-active" title="定位到当前会话">定位</button><button data-action="zoom-out" aria-label="缩小">-</button><span>${Math.round(state.zoom * 100)}%</span><button data-action="zoom-in" aria-label="放大">+</button>${state.hiddenCardIds.size > 0 ? `<button data-action="toggle-hidden-cards" class="${state.hiddenCardsOpen ? 'active' : ''}" title="查看或恢复从地图移除的对话块">已移除 ${state.hiddenCardIds.size}</button>` : ''}</div>` : ''
+  const hiddenCards = state.mode === 'canvas' && workspace !== null ? conversationCards(threads).filter(card => state.hiddenCardIds.has(card.id)) : []
+  const hiddenCardsPanel = state.mode === 'canvas' && state.hiddenCardsOpen && hiddenCards.length > 0
+    ? `<aside class="hidden-cards-panel"><header><strong>已从地图移除</strong><span>${hiddenCards.length} 个对话块 · 原会话完整保留</span><button data-action="restore-all-hidden">全部恢复</button><button data-action="toggle-hidden-cards" aria-label="关闭" title="关闭">×</button></header><ul>${hiddenCards.map(card => `<li><span class="hidden-card-question" title="${escapeHtml(card.question)}">${escapeHtml(card.question)}</span><button data-action="restore-card" data-card="${escapeHtml(card.id)}">恢复</button></li>`).join('')}</ul></aside>`
+    : ''
   const detailAvailable = currentThread() !== null
   const canvasTabs = `<nav class="canvas-tabs" aria-label="会话地图视图"><button class="${state.mode === 'canvas' ? 'active' : ''}" data-action="show-canvas">地图</button><button class="${state.mode === 'thread' ? 'active' : ''}" data-action="show-thread" data-thread="${state.activeId ?? ''}" ${detailAvailable ? '' : 'disabled'}>详情</button></nav>`
-  app.innerHTML = `<main class="synapse-shell ${state.sidebarCollapsed ? 'sidebar-collapsed' : ''}"><aside class="sidebar"><div class="sidebar-brand-row"><div class="brand" aria-label="Synapse"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 32 32" fill="none"><path d="M9 10.5 16 7l7 3.5M9 10.5v8L16 22m0-15v15m7-11.5v8L16 22"/><circle cx="9" cy="10" r="2.5"/><circle cx="23" cy="10" r="2.5"/><circle cx="16" cy="23" r="2.5"/></svg><strong>Synapse</strong></div><button class="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-label="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}" title="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.25"/><path d="M6 2v12"/></svg></button></div><button class="new-workspace" type="button" data-action="create-session" ${state.draft !== null ? 'disabled' : ''}><svg class="new-session-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v6.5M4.75 8h6.5"/></svg><span>新会话</span></button><label class="workspace-label"><span>工作区</span><span class="workspace-select"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 4.75h3l1.2 1.5h6.8v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"/></svg><select data-action="select-workspace" aria-label="选择工作区" ${state.draft !== null ? 'disabled' : ''}>${choices.map(item => `<option value="${item.id}" title="${escapeHtml(item.path ?? item.title)}" ${item.id === selectedWorkspaceId ? 'selected' : ''}>${escapeHtml(item.title)}</option>`).join('')}</select></span></label><div class="sidebar-heading"><span>会话</span></div><nav class="thread-tree">${threads.map(thread => `<button class="tree-row ${thread.id === state.activeId ? 'active' : ''}" data-action="select-thread" data-thread="${thread.id}" style="--thread-color:#374151"><span class="tree-dot"></span><span>${escapeHtml(threadListTitle(thread))}</span>${thread.parentId === null ? '' : '<i>分支</i>'}</button>`).join('') || '<p class="tree-empty">暂未同步会话</p>'}</nav></aside><header class="topbar"><div class="view-switch" role="group" aria-label="视图切换"><button data-action="close" type="button" aria-pressed="false">对话</button><button class="active" type="button" aria-pressed="true">会话地图</button></div>${canvasControls}</header><section class="main-stage">${state.error ? `<div class="status-message" role="alert"><span>${escapeHtml(state.error)}</span><button data-action="dismiss-error" aria-label="关闭" title="关闭">×</button></div>` : ''}${canvasTabs}${view}</section></main>`
+  app.innerHTML = `<main class="synapse-shell ${state.sidebarCollapsed ? 'sidebar-collapsed' : ''}"><aside class="sidebar"><div class="sidebar-brand-row"><div class="brand" aria-label="Synapse"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 32 32" fill="none"><path d="M9 10.5 16 7l7 3.5M9 10.5v8L16 22m0-15v15m7-11.5v8L16 22"/><circle cx="9" cy="10" r="2.5"/><circle cx="23" cy="10" r="2.5"/><circle cx="16" cy="23" r="2.5"/></svg><strong>Synapse</strong></div><button class="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-label="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}" title="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.25"/><path d="M6 2v12"/></svg></button></div><button class="new-workspace" type="button" data-action="create-session" ${state.draft !== null ? 'disabled' : ''}><svg class="new-session-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v6.5M4.75 8h6.5"/></svg><span>新会话</span></button><label class="workspace-label"><span>工作区</span><span class="workspace-select"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 4.75h3l1.2 1.5h6.8v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"/></svg><select data-action="select-workspace" aria-label="选择工作区" ${state.draft !== null ? 'disabled' : ''}>${choices.map(item => `<option value="${item.id}" title="${escapeHtml(item.path ?? item.title)}" ${item.id === selectedWorkspaceId ? 'selected' : ''}>${escapeHtml(item.title)}</option>`).join('')}</select></span></label><div class="sidebar-heading"><span>会话</span></div><nav class="thread-tree">${threads.map(thread => `<button class="tree-row ${thread.id === state.activeId ? 'active' : ''}" data-action="select-thread" data-thread="${thread.id}" style="--thread-color:#374151"><span class="tree-dot"></span><span>${escapeHtml(threadListTitle(thread))}</span>${thread.parentId === null ? '' : '<i>分支</i>'}</button>`).join('') || '<p class="tree-empty">暂未同步会话</p>'}</nav></aside><header class="topbar"><div class="view-switch" role="group" aria-label="视图切换"><button data-action="close" type="button" aria-pressed="false">对话</button><button class="active" type="button" aria-pressed="true">会话地图</button></div>${canvasControls}</header><section class="main-stage">${state.error ? `<div class="status-message" role="alert"><span>${escapeHtml(state.error)}</span><button data-action="dismiss-error" aria-label="关闭" title="关闭">×</button></div>` : ''}${canvasTabs}${view}${hiddenCardsPanel}</section></main>`
   installDragging()
   for (const [cardId, scrollTop] of cardScrollTops) {
     const answer = app.querySelector(`.thread-card[data-card-id="${CSS.escape(cardId)}"] .thread-answer`)
@@ -906,34 +980,121 @@ function applyCanvasTransform() {
   if (content instanceof HTMLElement) content.style.transform = `translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})`
 }
 
+/** Visible cards whose positions follow the dragged card, keyed by id. */
+function draggableSubtree(cardId) {
+  const threads = state.workspace?.threads ?? []
+  const allCards = conversationCards(threads)
+  const graph = conversationGraphView(allCards)
+  const visibleIds = new Set(graph.cards.map(card => card.id))
+  if (!visibleIds.has(cardId)) return { head: false, headCard: undefined, ids: new Set([cardId]), threadIds: new Set(), graph, elements: [] }
+  const childrenByParent = new Map()
+  for (const card of graph.cards) {
+    if (card.parentId === null) continue
+    const children = childrenByParent.get(card.parentId) ?? []
+    children.push(card.id)
+    childrenByParent.set(card.parentId, children)
+  }
+  const ids = new Set([cardId])
+  const pending = [cardId]
+  while (pending.length > 0) {
+    const id = pending.pop()
+    for (const childId of childrenByParent.get(id) ?? []) {
+      if (ids.has(childId)) continue
+      ids.add(childId)
+      pending.push(childId)
+    }
+  }
+  const headCard = graph.cards.find(card => card.id === cardId)
+  const threadIds = new Set(graph.cards.filter(card => ids.has(card.id)).map(card => card.dshThreadId))
+  const elements = [...document.querySelectorAll('.thread-card[data-card-id]')].filter(element => ids.has(element.dataset.cardId))
+  return { head: headCard?.turnIndex === 0, headCard, ids, threadIds, graph, elements }
+}
+
+/** The card under the pointer that may accept the dragged branch head. */
+function dropTargetAt(subtree, clientX, clientY) {
+  for (const element of document.querySelectorAll('.thread-card[data-card-id]:not(.draft-card)')) {
+    if (subtree.ids.has(element.dataset.cardId)) continue
+    const rect = element.getBoundingClientRect()
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) continue
+    const targetCard = subtree.graph.cards.find(card => card.id === element.dataset.cardId)
+    if (targetCard === undefined) continue
+    // Never mount a branch onto itself or one of its own descendants.
+    if (subtree.threadIds.has(targetCard.dshThreadId)) return null
+    return { element, card: targetCard }
+  }
+  return null
+}
+
+/** Re-mount the dragged branch head under the dropped card's thread. */
+async function reparentThread(draggedCard, targetCard) {
+  if (state.workspace === null) return
+  const thread = state.workspace.threads.find(item => item.id === draggedCard.dshThreadId)
+  if (thread === undefined) return
+  const anchorSeq = Number.isInteger(targetCard.sourceSeq) ? targetCard.sourceSeq : null
+  const updated = await api(`/synapse/api/threads/${thread.id}`, { method: 'PATCH', body: JSON.stringify({ parentId: targetCard.dshThreadId, anchorSeq }) })
+  thread.parentId = updated.thread.parentId
+  thread.anchorSeq = updated.thread.anchorSeq
+  // The in-memory anchor matches the lookup key in conversationCards and the
+  // server-side anchorSeq keeps the link across browsers.
+  rememberBranchAnchor(thread.id, targetCard.id)
+}
+
 function installDragging() {
   for (const handle of document.querySelectorAll('[data-drag-card]')) handle.addEventListener('pointerdown', event => {
     const cardId = event.currentTarget.dataset.dragCard
     const card = event.currentTarget.closest('.thread-card')
     if (cardId === undefined || !(card instanceof HTMLElement)) return
     event.preventDefault()
-    const origin = { x: event.clientX, y: event.clientY, position: { x: Number.parseFloat(card.style.left), y: Number.parseFloat(card.style.top) } }
-    const aliases = card.dataset.positionKey === undefined ? [] : [card.dataset.positionKey]
-    let position = origin.position
+    const subtree = draggableSubtree(cardId)
+    const elementById = new Map()
+    for (const element of subtree.elements) {
+      const left = Number.parseFloat(element.style.left)
+      const top = Number.parseFloat(element.style.top)
+      if (Number.isFinite(left) && Number.isFinite(top)) elementById.set(element.dataset.cardId, { element, left, top })
+    }
+    if (elementById.get(cardId) === undefined) return
+    const origin = { x: event.clientX, y: event.clientY }
     let stopped = false
+    let dropTarget = null
     state.dragging = true
     const move = moveEvent => {
-      position = { x: origin.position.x + (moveEvent.clientX - origin.x) / state.zoom, y: origin.position.y + (moveEvent.clientY - origin.y) / state.zoom }
-      state.cardPositions.set(cardId, { x: Math.round(position.x), y: Math.round(position.y) })
-      for (const alias of aliases) state.cardPositions.set(alias, { x: Math.round(position.x), y: Math.round(position.y) })
-      card.style.left = `${position.x}px`
-      card.style.top = `${position.y}px`
-      refreshCardConnectors(cardId)
+      const deltaX = (moveEvent.clientX - origin.x) / state.zoom
+      const deltaY = (moveEvent.clientY - origin.y) / state.zoom
+      for (const { element, left, top } of elementById.values()) {
+        element.style.left = `${left + deltaX}px`
+        element.style.top = `${top + deltaY}px`
+        refreshCardConnectors(element.dataset.cardId)
+      }
+      // Only a branch head (turn 0) can be mounted onto another branch.
+      const nextTarget = subtree.head ? dropTargetAt(subtree, moveEvent.clientX, moveEvent.clientY) : null
+      if (nextTarget?.element !== dropTarget?.element) {
+        if (dropTarget !== null) dropTarget.element.classList.remove('drop-target')
+        dropTarget = nextTarget
+        if (dropTarget !== null) dropTarget.element.classList.add('drop-target')
+      }
     }
-    const stop = () => {
+    const stop = async () => {
       if (stopped) return
       stopped = true
       document.removeEventListener('pointermove', move)
       document.removeEventListener('pointerup', stop)
       document.removeEventListener('pointercancel', stop)
-      rememberCardPosition(cardId, position, aliases)
+      if (dropTarget !== null) dropTarget.element.classList.remove('drop-target')
+      for (const [id, entry] of elementById) {
+        const position = { x: Number.parseFloat(entry.element.style.left), y: Number.parseFloat(entry.element.style.top) }
+        const positionKey = entry.element.dataset.positionKey
+        rememberCardPosition(id, position, positionKey === undefined ? [] : [positionKey])
+      }
       state.dragging = false
       deferCanvasRefresh(120)
+      const target = dropTarget
+      if (target !== null && subtree.head && subtree.headCard !== undefined) {
+        try {
+          await reparentThread(subtree.headCard, target.card)
+        } catch (error) {
+          setError(error)
+        }
+      }
       render()
     }
     document.addEventListener('pointermove', move)
@@ -1069,7 +1230,7 @@ app.addEventListener('click', async event => {
     if (button.dataset.action === 'select-thread' && thread !== undefined) {
       state.activeId = thread.id
       state.error = ''
-      if (state.workspace !== null) revealConversationThread(conversationCards(state.workspace.threads), thread.id)
+      revealThreadPresence(thread.id)
       render()
       void loadThreadHistory(thread)
       // Bidirectional current-session sync: switch DSH's current session
@@ -1106,6 +1267,31 @@ app.addEventListener('click', async event => {
     if (button.dataset.action === 'toggle-message' && button.dataset.message !== undefined) { state.expandedMessageIds.has(button.dataset.message) ? state.expandedMessageIds.delete(button.dataset.message) : state.expandedMessageIds.add(button.dataset.message); renderPreservingDetailScroll() }
     if (button.dataset.action === 'open-dsh' && thread?.dshSessionId !== null) post('synapse:open-session', { sessionId: thread.dshSessionId })
     if (button.dataset.action === 'archive-thread' && thread !== undefined) await archiveThread(thread)
+    if (button.dataset.action === 'hide-card' && button.dataset.card !== undefined) {
+      const cardId = button.dataset.card
+      if (state.workspace === null) return
+      const allCards = conversationCards(state.workspace.threads)
+      if (state.hiddenCardIds.has(cardId)) return
+      if (draftPlacement(allCards)?.parent.id === cardId) return setError('请先完成或取消正在编辑的追问或分支')
+      const nextHidden = new Set(state.hiddenCardIds).add(cardId)
+      const visible = conversationGraphView(allCards, state.collapsedCardIds, nextHidden).cards
+      const activeHasCards = allCards.some(card => card.dshThreadId === state.activeId)
+      if (activeHasCards && !visible.some(card => card.dshThreadId === state.activeId)) return setError('当前会话在地图上的最后一个对话块不能移除，请先切换会话')
+      state.hiddenCardIds.add(cardId)
+      persistHiddenCards()
+      render()
+    }
+    if (button.dataset.action === 'restore-card' && button.dataset.card !== undefined) {
+      state.hiddenCardIds.delete(button.dataset.card)
+      persistHiddenCards()
+      render()
+    }
+    if (button.dataset.action === 'restore-all-hidden') {
+      state.hiddenCardIds.clear()
+      persistHiddenCards()
+      render()
+    }
+    if (button.dataset.action === 'toggle-hidden-cards') { state.hiddenCardsOpen = !state.hiddenCardsOpen; render() }
     if (button.dataset.action === 'zoom-in') zoomCanvasAtCenter(.1)
     if (button.dataset.action === 'zoom-out') zoomCanvasAtCenter(-.1)
     if (button.dataset.action === 'focus-active') focusActiveCard()
@@ -1175,7 +1361,7 @@ window.addEventListener('message', event => {
     const thread = currentDshThread()
     if (thread !== undefined) {
       state.activeId = thread.id
-      if (state.workspace !== null) revealConversationThread(conversationCards(state.workspace.threads), thread.id)
+      revealThreadPresence(thread.id)
     }
     if (previousId !== data.session?.id) void openCurrentWorkspace().then(opened => { if (!opened && canReplaceView()) render() }).catch(setError)
     else if (canReplaceView()) render()

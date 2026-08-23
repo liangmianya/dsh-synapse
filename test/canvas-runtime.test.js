@@ -213,11 +213,15 @@ test('prevents collapse from hiding drafts or the active conversation and restor
 test('reveals hidden ancestor paths when a conversation becomes current', async () => {
   const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
   const reveal = source.slice(source.indexOf('function revealConversationThread'), source.indexOf('function canvasConnectors'))
+  const presence = source.slice(source.indexOf('function revealThreadPresence'), source.indexOf('function conversationCard(card, graph)'))
   const current = source.slice(source.indexOf("data.type === 'synapse:current-session'"), source.indexOf("data.type === 'synapse:live-reply'"))
 
   assert.match(reveal, /state\.collapsedCardIds\.delete\(parentId\)/)
   assert.match(reveal, /persistCollapsedCards\(\)/)
-  assert.match(current, /revealConversationThread\(conversationCards\(state\.workspace\.threads\), thread\.id\)/)
+  assert.match(presence, /revealConversationThread\(allCards, threadId\)/)
+  assert.match(presence, /state\.hiddenCardIds\.delete\(card\.id\)/)
+  assert.match(presence, /persistHiddenCards\(\)/)
+  assert.match(current, /revealThreadPresence\(thread\.id\)/)
 })
 
 test('prunes persisted collapsed state when a conversation is archived', async () => {
@@ -227,4 +231,72 @@ test('prunes persisted collapsed state when a conversation is archived', async (
   assert.match(archive, /state\.collapsedCardIds/)
   assert.match(archive, /key\.startsWith\(`\$\{id\}:`\)/)
   assert.match(archive, /persistCollapsedCards\(\)/)
+})
+
+test('removing a turn from the map guards drafts and the last visible active card', async () => {
+  const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const hide = source.slice(source.indexOf("button.dataset.action === 'hide-card'"), source.indexOf("button.dataset.action === 'restore-card'"))
+
+  assert.match(hide, /draftPlacement\(allCards\)\?\.parent\.id === cardId/)
+  assert.match(hide, /请先完成或取消正在编辑的追问或分支/)
+  assert.match(hide, /conversationGraphView\(allCards, state\.collapsedCardIds, nextHidden\)/)
+  assert.match(hide, /当前会话在地图上的最后一个对话块不能移除/)
+  assert.match(hide, /persistHiddenCards\(\)/)
+})
+
+test('removed turns can be restored individually or all at once from a panel', async () => {
+  const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const restore = source.slice(source.indexOf("button.dataset.action === 'restore-card'"), source.indexOf("button.dataset.action === 'zoom-in'"))
+
+  assert.match(restore, /state\.hiddenCardIds\.delete\(button\.dataset\.card\)/)
+  assert.match(restore, /state\.hiddenCardIds\.clear\(\)/)
+  assert.match(restore, /state\.hiddenCardsOpen = !state\.hiddenCardsOpen/)
+  assert.match(source, /class="hidden-cards-panel"/)
+  assert.match(source, /data-action="restore-card"/)
+  assert.match(source, /data-action="restore-all-hidden"/)
+  assert.match(source, /HIDDEN_CARDS_KEY/)
+  assert.match(source, /localStorage\.setItem\(HIDDEN_CARDS_KEY/)
+  assert.match(source, />已移除 \$\{state\.hiddenCardIds\.size\}</)
+})
+
+test('drags the whole descendant subtree and re-mounts a branch head onto a dropped card', async () => {
+  const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const drag = source.slice(source.indexOf('function draggableSubtree'), source.indexOf('function canvasViewport'))
+
+  assert.match(drag, /const childrenByParent = new Map\(\)/)
+  assert.match(drag, /const ids = new Set\(\[cardId\]\)/)
+  assert.match(drag, /pending\.pop\(\)/)
+  assert.match(drag, /headCard\?\.turnIndex === 0/)
+  assert.match(drag, /classList\.add\('drop-target'\)/)
+  assert.match(drag, /classList\.remove\('drop-target'\)/)
+  assert.match(drag, /rememberCardPosition\(id, position/)
+  assert.match(drag, /method: 'PATCH'/)
+  assert.match(drag, /parentId: targetCard\.dshThreadId, anchorSeq/)
+  assert.match(drag, /rememberBranchAnchor\(thread\.id, targetCard\.id\)/)
+})
+
+test('a removed turn leaves the conversation intact and keeps the visible chain connected', async () => {
+  const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const graph = source.slice(source.indexOf('function conversationGraphView'), source.indexOf('function revealConversationThread'))
+
+  assert.match(graph, /hiddenCardIds = state\.hiddenCardIds/)
+  assert.match(graph, /effectiveParent/)
+  assert.match(graph, /!hiddenCardIds\.has\(parentId\)/)
+  assert.match(graph, /\.filter\(card => !hiddenCardIds\.has\(card\.id\)\)/)
+})
+
+test('empty canvas offers restoring every removed turn when nothing else is visible', async () => {
+  const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const canvas = source.slice(source.indexOf('function renderCanvas'), source.indexOf('function isProcessMessage'))
+
+  assert.match(canvas, /cards\.length === 0 && state\.draft === null/)
+  assert.match(canvas, /data-action="restore-all-hidden"/)
+  assert.match(canvas, /画布上没有可见的对话块/)
+})
+
+test('fork anchors persist under the canvas thread id so re-mounted links survive reloads', async () => {
+  const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const branch = source.slice(source.indexOf("const session = await dshRpc('synapse:fork-session'"), source.indexOf("if (state.workspace !== null && !state.workspace.threads.some"))
+
+  assert.match(branch, /rememberBranchAnchor\(result\.thread\.id, draft\.anchorId\)/)
 })
