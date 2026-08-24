@@ -273,3 +273,68 @@ test('truncates over-long projections with a detail-view marker', async () => {
   assert.equal(assistant.text.length, 8_000 + '\n——…（详情查看全文）'.length)
   assert.ok(assistant.text.endsWith('——…（详情查看全文）'))
 })
+
+test('re-mounts a thread onto another branch with an anchored turn sequence and persists it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-reparent-'))
+  const dataFile = join(directory, 'state.json')
+  const store = new WorkspaceStore(dataFile)
+  const workspace = await store.create('重挂载测试')
+  const parent = await store.createThread(workspace.id, { title: '父分支', dshSessionId: 'parent' })
+  const child = await store.createThread(workspace.id, { title: '子分支', parentId: parent.id, dshSessionId: 'child' })
+  const other = await store.createThread(workspace.id, { title: '另一个分支', dshSessionId: 'other' })
+
+  const updated = await store.updateThread(child.id, { parentId: other.id, anchorSeq: 5 })
+  assert.equal(updated.parentId, other.id)
+  assert.equal(updated.anchorSeq, 5)
+
+  // The DSH session link stays intact: re-mounting is canvas-only.
+  const reloaded = await new WorkspaceStore(dataFile).get(workspace.id)
+  const persisted = reloaded.threads.find(thread => thread.id === child.id)
+  assert.equal(persisted.parentId, other.id)
+  assert.equal(persisted.anchorSeq, 5)
+  assert.equal(persisted.dshSessionId, 'child')
+})
+
+test('detaching a thread clears its anchor sequence', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-detach-'))
+  const store = new WorkspaceStore(join(directory, 'state.json'))
+  const workspace = await store.create('分离测试')
+  const parent = await store.createThread(workspace.id, { title: '父分支' })
+  const child = await store.createThread(workspace.id, { title: '子分支', parentId: parent.id })
+
+  await store.updateThread(child.id, { parentId: null, anchorSeq: 5 })
+  const graph = await store.get(workspace.id)
+  assert.equal(graph.threads[1].parentId, null)
+  assert.equal(graph.threads[1].anchorSeq, null)
+})
+
+test('rejects re-mounting onto self, descendants, or a missing target', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-reparent-guard-'))
+  const store = new WorkspaceStore(join(directory, 'state.json'))
+  const workspace = await store.create('环校验')
+  const root = await store.createThread(workspace.id, { title: '根' })
+  const child = await store.createThread(workspace.id, { title: '子', parentId: root.id })
+
+  await assert.rejects(store.updateThread(root.id, { parentId: root.id }), /不能把节点挂到它自己下面/)
+  await assert.rejects(store.updateThread(root.id, { parentId: child.id }), /不能把节点挂到它自己的后续分支上/)
+  await assert.rejects(store.updateThread(root.id, { parentId: 'missing-thread' }), /挂载目标节点不存在/)
+  await assert.rejects(store.updateThread(root.id, { parentId: 42 }), /节点 id 必须是字符串/)
+})
+
+test('keeps a re-mounted thread off the DSH lineage so projection never rewires it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-reparent-dsh-'))
+  const store = new WorkspaceStore(join(directory, 'state.json'))
+  const session = { id: 's1', header: { meta: { cwd: 'C:\\work\\x' } }, firstLiveSeq: 0, events: [] }
+  const thread = await store.projectSession(session)
+  const otherSession = { id: 's2', header: { meta: { cwd: 'C:\\work\\x' } }, firstLiveSeq: 0, events: [] }
+  const other = await store.projectSession(otherSession)
+
+  await store.updateThread(thread.id, { parentId: other.id, anchorSeq: null })
+  // Re-projecting the same session must not reset the user's canvas mounting.
+  await store.projectSession(session)
+  const [workspace] = await store.list()
+  const graph = await store.get(workspace.id)
+  const mounted = graph.threads.find(item => item.id === thread.id)
+  assert.equal(mounted.parentId, other.id)
+  assert.equal(mounted.anchorSeq, null)
+})

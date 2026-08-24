@@ -157,6 +157,33 @@ export class WorkspaceStore {
       const { workspace, thread } = this.locateThread(threadId)
       if (input?.title !== undefined) thread.title = requiredText(input.title, MAX_TITLE_LENGTH, 'title')
       if (input?.position !== undefined) thread.position = positionOf(input.position)
+      if (input?.parentId !== undefined) {
+        // Re-mounting is a canvas-only reorganization: the DSH fork lineage
+        // stays in `sourceParentSessionId`/`sourceSeedLength` and is never
+        // touched here, so the native conversation remains intact.
+        const nextParentId = input.parentId === null ? null : requiredId(input.parentId)
+        if (nextParentId !== null) {
+          if (nextParentId === thread.id) throw new InputError('不能把节点挂到它自己下面')
+          const target = workspace.threads.find(item => item.id === nextParentId)
+          if (target === undefined) throw new InputError('挂载目标节点不存在')
+          // Walk the target's ancestor chain: attaching to a descendant would
+          // close a cycle and strand the dragged subtree in a loop.
+          const visited = new Set()
+          let cursor = target
+          while (cursor !== undefined && !visited.has(cursor.id)) {
+            visited.add(cursor.id)
+            if (cursor.id === thread.id) throw new InputError('不能把节点挂到它自己的后续分支上')
+            cursor = workspace.threads.find(item => item.id === cursor.parentId)
+          }
+        }
+        thread.parentId = nextParentId
+        if (nextParentId === null) thread.anchorSeq = null
+      }
+      if (input?.anchorSeq !== undefined) {
+        // The exact parent-turn card this thread's head attaches to; `null`
+        // attaches after the parent's latest turn.
+        thread.anchorSeq = thread.parentId === null || !Number.isSafeInteger(input.anchorSeq) || input.anchorSeq < 0 ? null : input.anchorSeq
+      }
       thread.updatedAt = new Date().toISOString()
       workspace.updatedAt = thread.updatedAt
       return structuredClone(thread)
@@ -621,6 +648,11 @@ function positionOf(value) {
   const y = Number(value?.y)
   if (!Number.isFinite(x) || !Number.isFinite(y)) throw new InputError('position 必须包含有效坐标')
   return { x: Math.round(Math.max(-2000, Math.min(5000, x))), y: Math.round(Math.max(-2000, Math.min(5000, y))) }
+}
+
+function requiredId(value) {
+  if (typeof value !== 'string' || value.trim() === '') throw new InputError('节点 id 必须是字符串')
+  return value.trim()
 }
 
 function requiredText(value, maxLength, field) {

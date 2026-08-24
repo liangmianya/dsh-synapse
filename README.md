@@ -1,6 +1,6 @@
 # dsh-synapse
 
-![version](https://img.shields.io/badge/version-0.3.0-3478f6?style=flat-square)
+![version](https://img.shields.io/badge/version-0.4.0-3478f6?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-10b981?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-web-7c3aed?style=flat-square)
 ![node](https://img.shields.io/badge/node-%3E%3D22.19-334155?style=flat-square)
@@ -34,6 +34,8 @@
 | 🔧 | 工具过程折叠 | 工具调用与结果按 `callId` 配对，折叠进对应助手回复卡，不再单独成卡 |
 | ⚡ | 会话同步 | 原生对话与会话地图双向同步当前会话——任一侧切换，另一侧跟随高亮 |
 | 🎨 | 画布交互 | 拖动画布、缩放视图（最高 4×）、移动卡片（位置自动保存）、展开/折叠后续对话子树、一键定位当前会话，卡片内平滑滚动 |
+| 🧲 | 分支重挂载 | 拖动分支首卡（第 1 轮）即可整支移动；松手到另一张卡片上，该分支会挂载到目标卡片处，整条分支随之换行换支 |
+| 🗑️ | 选择性移除 | 把单个对话块从地图移除（原会话在 DSH 中完整保留），被移除的块可在「已移除」面板中逐个或全部恢复 |
 | 🔒 | 原生会话不变 | 打开、追问、创建和归档仍由 DSH 会话系统完成；Synapse 只提供另一种查看与组织方式 |
 
 ![Native dialogue and Synapse toggle](docs/images/native-webui.png)
@@ -123,11 +125,15 @@ corepack pnpm dsh plugin --profile web remove dsh-synapse
 1. 在 DSH 中选择工作目录，或打开一个已有会话。
 2. 点击顶部"会话地图"进入画布。
 3. 浏览画布卡片：点击卡片或侧边栏会话即可切换当前会话（原生页同步跟随）；"分支"操作保留一条替代路径。
-4. 点击卡片底部"详情"查看完整对话记录；点击顶部"对话"切换或卡片"在 DSH 中打开"，回到原生对话。
+4. 拖动卡片顶部把手移动卡片；拖动分支首卡（第 1 轮）会连同其后所有追问与分支一起移动，把首卡松手到另一张卡片上即可把整条分支挂载到那里。
+5. 卡片底部的"移除"只把该对话块从地图隐藏（原会话完整保留，随时在右上角"已移除"面板恢复）；"归档"才把整条会话连同分支移出画布。
+6. 点击卡片底部"详情"查看完整对话记录；点击顶部"对话"切换或卡片"在 DSH 中打开"，回到原生对话。
 
 ### 数据与边界
 
 - 画布元数据保存在 DSH Home 的 `synapse/workspaces.json`（当前 schema v4，自动迁移旧版数据）。
+- 重挂载的分支关系（`parentId` 与锚点 `anchorSeq`）持久化在画布元数据中，DSH 的 fork 血缘（`sourceParentSessionId`）不会被改写。
+- 单个对话块的移除是本机视图状态（浏览器 localStorage），不影响 DSH 会话，也不会同步到其他浏览器。
 - 单条消息投影上限 **8000 字符**，超出截断并标注"—…（详情查看全文）"。
 - 会话内容仍由 DSH session log 保存和管理。
 - 本插件不启动第二个 Web 服务、不创建第二套 Agent，也不改变 DSH 的模型或工具执行行为。
@@ -162,6 +168,8 @@ Complex work is rarely linear. You may need to preserve one approach, return to 
 | 🔧 | Folded tool process | Tool calls and results pair by `callId` and fold into the assistant reply card instead of becoming standalone cards |
 | ⚡ | Session sync | The native chat and the session map sync the current session bidirectionally — switching on either side highlights the other |
 | 🎨 | Canvas interaction | Pan, zoom (up to 4×), move cards (positions persist), expand or collapse descendant subtrees, one-click focus on the current session, and smooth scrolling inside each card |
+| 🧲 | Branch re-mounting | Drag a branch's first card (turn 1) to move the whole subtree; release it on another card to mount that branch there, moving the entire branch to a new lane or tree |
+| 🗑️ | Selective removal | Remove a single conversation block from the map (the original session stays intact in DSH); restore removed blocks one by one or all at once from the "Removed" panel |
 | 🔒 | Native sessions stay native | Opening, prompting, creating, and archiving sessions remains DSH-owned; Synapse only changes how they are viewed and organized |
 
 ### Quick start
@@ -249,11 +257,15 @@ The plugin is injected through the profile's `cordis.patch.yml`. Override any ke
 1. Select a working directory or open an existing DSH session.
 2. Open "Session Map" from the top switch.
 3. Browse the canvas: clicking a card or a sidebar session switches the current session (the native page follows); the "branch" action keeps an alternative path.
-4. Open "Details" at the bottom of a card for the full conversation; return to the native chat with the top "Dialogue" switch or a card's "Open in DSH" button.
+4. Drag the top handle to move a card; dragging a branch's first card (turn 1) moves all its follow-ups and branches along. Drop that first card on another card to mount the branch there.
+5. A card's "Remove" button only hides that block from the map (the original session stays intact; restore it any time from the "Removed" panel in the top-right). "Archive" removes the whole session and its branches from the canvas.
+6. Open "Details" at the bottom of a card for the full conversation; return to the native chat with the top "Dialogue" switch or a card's "Open in DSH" button.
 
 ### Data and scope
 
 - Canvas metadata is stored in `synapse/workspaces.json` under DSH Home (schema v4, old data migrates automatically).
+- Re-mounted branch relations (`parentId` plus the `anchorSeq` anchor) persist in the canvas metadata; the DSH fork lineage (`sourceParentSessionId`) is never rewritten.
+- Removing a single conversation block is local view state (browser localStorage): it never touches the DSH session and does not sync to other browsers.
 - Projected messages are capped at **8000 characters**; longer replies truncate with a "—…（详情查看全文）" marker.
 - DSH remains the owner of session-log content.
 - This plugin starts no second web server, creates no second agent, and does not modify model or tool execution.
