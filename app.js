@@ -870,10 +870,10 @@ function draftCard(cards) {
   </article>`
 }
 
-function renderCanvas() {
+function renderCanvas(allCards = undefined) {
   const threads = state.workspace?.threads ?? []
   if (threads.length === 0 && state.draft?.kind !== 'new') return `<section class="empty-canvas"><strong>当前工作目录还没有 DSH 对话。</strong><p>点击新会话，在画布中输入第一条消息。</p><div><button class="primary" type="button" data-action="create-session">新建会话</button></div></section>`
-  const allCards = conversationCards(threads)
+  allCards ??= conversationCards(threads)
   const graph = conversationGraphView(allCards)
   const cards = graph.cards
   if (cards.length === 0 && state.draft === null) {
@@ -949,11 +949,14 @@ function render() {
   }
   const workspace = state.workspace
   const threads = workspace?.threads ?? []
-  const view = state.mode === 'thread' ? renderThread() : renderCanvas()
+  // One card-graph computation per render: the canvas view and the removed
+  // panel share it, so an event burst never re-lays-out the graph twice.
+  const allCards = state.mode === 'canvas' && workspace !== null ? conversationCards(threads) : null
+  const view = state.mode === 'thread' ? renderThread() : renderCanvas(allCards)
   const choices = workspaceChoices()
   const selectedWorkspaceId = state.selectedDshWorkspaceId ?? workspace?.id
   const canvasControls = state.mode === 'canvas' && (threads.length > 0 || state.draft?.kind === 'new') ? `<div class="canvas-controls"><button data-action="layout">整理节点</button><button data-action="focus-active" title="定位到当前会话">定位</button><button data-action="zoom-out" aria-label="缩小">-</button><span>${Math.round(state.zoom * 100)}%</span><button data-action="zoom-in" aria-label="放大">+</button>${state.hiddenCardIds.size > 0 ? `<button data-action="toggle-hidden-cards" class="${state.hiddenCardsOpen ? 'active' : ''}" title="查看或恢复从地图移除的对话块">已移除 ${state.hiddenCardIds.size}</button>` : ''}</div>` : ''
-  const hiddenCards = state.mode === 'canvas' && workspace !== null ? conversationCards(threads).filter(card => state.hiddenCardIds.has(card.id)) : []
+  const hiddenCards = state.mode === 'canvas' ? (allCards ?? []).filter(card => state.hiddenCardIds.has(card.id)) : []
   const hiddenCardsPanel = state.mode === 'canvas' && state.hiddenCardsOpen && hiddenCards.length > 0
     ? `<aside class="hidden-cards-panel"><header><strong>已从地图移除</strong><span>${hiddenCards.length} 个对话块 · 原会话完整保留</span><button data-action="restore-all-hidden">全部恢复</button><button data-action="toggle-hidden-cards" aria-label="关闭" title="关闭">×</button></header><ul>${hiddenCards.map(card => `<li><span class="hidden-card-question" title="${escapeHtml(card.question)}">${escapeHtml(card.question)}</span><button data-action="restore-card" data-card="${escapeHtml(card.id)}">恢复</button></li>`).join('')}</ul></aside>`
     : ''
@@ -1032,6 +1035,9 @@ async function reparentThread(draggedCard, targetCard) {
   if (thread === undefined) return
   const anchorSeq = Number.isInteger(targetCard.sourceSeq) ? targetCard.sourceSeq : null
   const updated = await api(`/synapse/api/threads/${thread.id}`, { method: 'PATCH', body: JSON.stringify({ parentId: targetCard.dshThreadId, anchorSeq }) })
+  // Never trust a stale backend: an older index.js ignores parentId/anchorSeq
+  // and would silently revert the drop. Surface the mismatch instead.
+  if (updated.thread?.parentId !== targetCard.dshThreadId) throw new Error('分支挂载未生效：运行中的 DSH 尚未加载新版插件，请重启 DSH 后再试')
   thread.parentId = updated.thread.parentId
   thread.anchorSeq = updated.thread.anchorSeq
   // The in-memory anchor matches the lookup key in conversationCards and the
