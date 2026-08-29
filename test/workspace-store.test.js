@@ -135,7 +135,7 @@ test('migrates v3 tool cards into the assistant process records', async () => {
   assert.match(await readFile(dataFile, 'utf8'), /"version": ?4/)
 })
 
-test('does not persist the DSH runtime context as a user conversation turn', async () => {
+test('does not persist DSH internal context as a user conversation turn', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-runtime-context-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
   await store.projectSession({
@@ -143,13 +143,41 @@ test('does not persist the DSH runtime context as a user conversation turn', asy
     events: [
       { type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'text', text: '你好' }] } },
       { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\\nPolicy.' }] } },
-      { type: 'assistant/message', seq: 3, time: 3, data: { message: { content: [{ type: 'text', text: '你好，我是助手。' }] } } },
+      { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '<system-reminder>Instructions from: AGENTS.md</system-reminder>' }] } },
+      { type: 'assistant/message', seq: 4, time: 4, data: { message: { content: [{ type: 'text', text: '你好，我是助手。' }] } } },
     ],
   })
 
   const [workspace] = await store.list()
   const graph = await store.get(workspace.id)
   assert.deepEqual(graph.threads[0].messages.map(message => message.text), ['你好', '你好，我是助手。'])
+})
+
+test('removes persisted system reminders when loading an existing workspace', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-system-reminder-'))
+  const dataFile = join(directory, 'state.json')
+  await writeFile(dataFile, JSON.stringify({
+    version: 4,
+    hiddenSessionIds: [],
+    workspaces: [{
+      id: 'w-1', kind: 'dsh', cwd: 'C:\\work\\canvas', title: 'canvas',
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+      threads: [{
+        id: 't-1', title: '会话', parentId: null, dshSessionId: 's-1', dshSessionTitle: null,
+        color: '#0f766e', position: { x: 86, y: 82 }, sourceSeedLength: null,
+        createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+        messages: [
+          { id: 'm-1', kind: 'user', text: '<system-reminder>Instructions from: AGENTS.md</system-reminder>', at: '2026-01-01T00:00:00.000Z' },
+          { id: 'm-2', kind: 'user', text: '实际提问', at: '2026-01-01T00:00:01.000Z' },
+        ],
+      }],
+    }],
+  }))
+
+  const store = new WorkspaceStore(dataFile)
+  const graph = await store.get('w-1')
+  assert.deepEqual(graph.threads[0].messages.map(message => message.text), ['实际提问'])
+  assert.doesNotMatch(await readFile(dataFile, 'utf8'), /<system-reminder>/)
 })
 
 test('merges a browser fork callback with an already projected DSH fork', async () => {

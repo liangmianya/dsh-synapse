@@ -683,7 +683,9 @@ function noteProjection(kind, text) {
 }
 
 function isRuntimeContextText(text) {
-  return typeof text === 'string' && text.trimStart().startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')
+  if (typeof text !== 'string') return false
+  const normalized = text.trimStart()
+  return normalized.startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.') || normalized.startsWith('<system-reminder>')
 }
 
 function isRuntimeContextMessage(message) {
