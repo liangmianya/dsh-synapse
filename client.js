@@ -26,6 +26,31 @@ window.__ModuleLoader__.load({
       ]
     }
 
+    // The host deliberately limits JSON bodies to 32 KiB. Session lists can
+    // exceed that even with ordinary titles, so batch by UTF-8 bytes rather
+    // than raising the API-wide input limit. Partial upserts are supported;
+    // removals are explicit and only advance after every batch succeeds.
+    function sessionSyncBodies(sessions, removedSessionIds) {
+      const limit = 24 * 1024
+      const encoder = new TextEncoder()
+      const bodies = []
+      let batch = { sessions: [], removedSessionIds: [] }
+      const size = value => encoder.encode(JSON.stringify(value)).byteLength
+      const add = (field, value) => {
+        batch[field].push(value)
+        if (size(batch) <= limit) return
+        batch[field].pop()
+        if (batch.sessions.length || batch.removedSessionIds.length) bodies.push(JSON.stringify(batch))
+        batch = { sessions: [], removedSessionIds: [] }
+        batch[field].push(value)
+        if (size(batch) > limit) throw new Error('单条会话元数据超过同步大小限制')
+      }
+      for (const session of sessions) add('sessions', session)
+      for (const id of removedSessionIds) add('removedSessionIds', id)
+      if (batch.sessions.length || batch.removedSessionIds.length || !bodies.length) bodies.push(JSON.stringify(batch))
+      return bodies
+    }
+
     module.exports.inject = ['sessions', 'workspaces']
     module.exports.apply = ctx => {
       const prompt = async (sessionId, text) => {
@@ -62,7 +87,16 @@ window.__ModuleLoader__.load({
         setView('dialog')
       }
       const send = (type, payload) => { frame.contentWindow?.postMessage({ source: 'dsh-synapse', type, ...payload }, location.origin) }
-      let syncQueued = false
+      let syncTimer = 0
+      let syncRunning = false
+      let syncPending = false
+      let syncDisposed = false
+      let syncAbort = null
+      let lastSyncedSessions = ''
+      let failedSyncSessions = ''
+      let syncRetryTimer = 0
+      let syncRetryCount = 0
+      let syncRetryEpoch = 0
       let knownSessionIds = new Set()
       const liveUnsubscribers = new Map()
       const syncLiveSessions = () => {
@@ -83,34 +117,110 @@ window.__ModuleLoader__.load({
         }
         for (const [id, unsubscribe] of liveUnsubscribers) if (!snapshot.ids.includes(id)) { unsubscribe(); liveUnsubscribers.delete(id) }
       }
-      const syncSessions = () => {
-        if (syncQueued) return
-        syncQueued = true
-        queueMicrotask(() => {
-          syncQueued = false
-          const sessions = sessionSnapshot(ctx)
-          const sessionIds = new Set(sessions.map(session => session.id))
-          const removedSessionIds = [...knownSessionIds].filter(id => !sessionIds.has(id))
+      // List notifications also fire for streaming state. Sync metadata only
+      // when its serialized content changes, with one request in flight and a
+      // bounded delay that cannot be postponed forever by an active stream.
+      const flushSessionSync = async () => {
+        syncTimer = 0
+        if (syncDisposed || syncRunning) return
+        syncPending = false
+        const sessions = sessionSnapshot(ctx)
+        const signature = JSON.stringify(sessions)
+        if (signature === lastSyncedSessions || signature === failedSyncSessions) return
+        window.clearTimeout(syncRetryTimer)
+        const sessionIds = new Set(sessions.map(session => session.id))
+        const removedSessionIds = [...knownSessionIds].filter(id => !sessionIds.has(id))
+        syncRunning = true
+        const retryEpoch = syncRetryEpoch
+        let permanentFailure = false
+        let timeout = 0
+        try {
+          let bodies
+          try { bodies = sessionSyncBodies(sessions, removedSessionIds) }
+          catch (error) { permanentFailure = true; throw error }
+          // Each POST commits independently. A timeout may follow a committed
+          // upsert, so remember potentially sent IDs and invalidate the old
+          // baseline until the complete pass succeeds.
+          lastSyncedSessions = ''
+          for (const body of bodies) {
+            if (syncDisposed) return
+            for (const item of JSON.parse(body).sessions) knownSessionIds.add(item.id)
+            const controller = new AbortController()
+            syncAbort = controller
+            timeout = window.setTimeout(() => controller.abort(), 30000)
+            const response = await fetch('/synapse/api/sessions/sync', {
+              method: 'POST', headers: { 'content-type': 'application/json' }, body, signal: syncAbort.signal,
+            })
+            permanentFailure = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429
+            const result = await response.json()
+            window.clearTimeout(timeout)
+            if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`)
+          }
           knownSessionIds = sessionIds
-          void fetch('/synapse/api/sessions/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessions, removedSessionIds }) }).catch(() => {})
-        })
+          lastSyncedSessions = signature
+          failedSyncSessions = ''
+          syncRetryCount = 0
+          window.clearTimeout(syncRetryTimer)
+        } catch (error) {
+          // Reject identical bad input without a per-token storm; transient
+          // failures get three delayed retries, rather than silently staying stale.
+          failedSyncSessions = retryEpoch === syncRetryEpoch ? signature : ''
+          if (!syncDisposed) {
+            console.warn('[synapse] session metadata sync failed:', error instanceof Error ? error.message : String(error))
+            if (!permanentFailure && syncRetryCount < 3 && retryEpoch === syncRetryEpoch) {
+              window.clearTimeout(syncRetryTimer)
+              syncRetryTimer = window.setTimeout(() => {
+                if (syncDisposed || retryEpoch !== syncRetryEpoch || failedSyncSessions !== signature) return
+                failedSyncSessions = ''
+                syncSessions()
+              }, 2000 * 2 ** syncRetryCount++)
+            }
+          }
+        } finally {
+          window.clearTimeout(timeout)
+          syncAbort = null
+          syncRunning = false
+          if (syncPending && !syncDisposed) syncSessions()
+        }
+      }
+      const syncSessions = () => {
+        if (syncDisposed) return
+        syncPending = true
+        if (!syncRunning && !syncTimer) syncTimer = window.setTimeout(flushSessionSync, 500)
       }
       const syncTheme = () => {
         const dark = document.body?.hasAttribute?.('data-ds-dark-theme') === true
         send('synapse:theme', { dark })
       }
+      let lastMapWorkspaces = ''
+      let lastMapSession = ''
       const syncCurrentSession = () => {
+        if (syncDisposed) return
         syncSessions()
         syncLiveSessions()
         syncTheme()
         if (!overlay.hidden) {
-          send('synapse:workspaces', { workspaces: workspaceSnapshot(ctx) })
-          send('synapse:current-session', { session: currentSession(ctx) })
+          // Streaming status notifications do not imply changed map metadata.
+          // Reposting identical workspaces used to fan out projection GETs.
+          const workspaces = workspaceSnapshot(ctx)
+          const session = currentSession(ctx)
+          const workspaceKey = JSON.stringify(workspaces)
+          const sessionKey = JSON.stringify(session)
+          if (workspaceKey !== lastMapWorkspaces) {
+            lastMapWorkspaces = workspaceKey
+            send('synapse:workspaces', { workspaces })
+          }
+          if (sessionKey !== lastMapSession) {
+            lastMapSession = sessionKey
+            send('synapse:current-session', { session })
+          }
         }
       }
       let mapOpenFallback = 0
       let mapOpening = false
       const showMapOverlay = () => {
+        // A delayed ready message must not reopen a map the user just closed.
+        if (syncDisposed || !mapOpening) return
         window.clearTimeout(mapOpenFallback)
         mapOpening = false
         overlay.hidden = false
@@ -118,6 +228,10 @@ window.__ModuleLoader__.load({
         syncCurrentSession()
       }
       const open = () => {
+        syncRetryEpoch++
+        syncRetryCount = 0
+        window.clearTimeout(syncRetryTimer)
+        failedSyncSessions = ''
         window.clearTimeout(mapOpenFallback)
         mapOpening = true
         setView('map')
@@ -126,12 +240,15 @@ window.__ModuleLoader__.load({
         overlay.hidden = false
         overlay.classList.add('is-opening')
         window.requestAnimationFrame(() => {
+          if (syncDisposed || !mapOpening) return
           send('synapse:map-opened')
           syncCurrentSession()
         })
         mapOpenFallback = window.setTimeout(showMapOverlay, 300)
       }
       const onFrameLoad = () => {
+        lastMapWorkspaces = ''
+        lastMapSession = ''
         syncCurrentSession()
         if (mapOpening) send('synapse:map-opened')
       }
@@ -223,6 +340,11 @@ window.__ModuleLoader__.load({
       window.addEventListener('message', onMessage)
       window.addEventListener('keydown', onKeyDown)
       ctx.effect(() => () => {
+        syncDisposed = true
+        window.clearTimeout(syncTimer)
+        window.clearTimeout(syncRetryTimer)
+        window.clearTimeout(mapOpenFallback)
+        syncAbort?.abort()
         dialogButton.removeEventListener('click', close)
         mapButton.removeEventListener('click', open)
         frame.removeEventListener('load', onFrameLoad)
