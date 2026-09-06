@@ -195,7 +195,7 @@ export class WorkspaceStore {
   }
 
   /** Replay one live DSH session into the dedicated projection workspace. */
-  async projectSession(session, replayFrom = 0, workspaceTitle = 'DSH 任务') {
+  async projectSession(session, replayFrom = 0, workspaceTitle = 'DSH 任务', { snapshot = true } = {}) {
     return this.mutate(() => {
       if (this.state.hiddenSessionIds.includes(session.id)) return null
       const workspace = this.dshWorkspace(sessionCwd(session), workspaceTitle)
@@ -203,7 +203,10 @@ export class WorkspaceStore {
       for (const event of session.events) {
         if (event.seq >= replayFrom) this.projectEventInto(workspace, thread, event)
       }
-      return structuredClone(thread)
+      // Callers that only maintain the graph pass { snapshot: false }; cloning a
+      // growing thread on every background update costs allocation for a result
+      // nobody reads.
+      return snapshot ? structuredClone(thread) : null
     }, { deferred: true })
   }
 
@@ -219,14 +222,14 @@ export class WorkspaceStore {
   }
 
   /** Project a batch of committed events for one session in a single write. */
-  async projectEvents(session, events, workspaceTitle = 'DSH 任务') {
+  async projectEvents(session, events, workspaceTitle = 'DSH 任务', { snapshot = true } = {}) {
     if (events.length === 0) return null
     return this.mutate(() => {
       if (this.state.hiddenSessionIds.includes(session.id)) return null
       const workspace = this.dshWorkspace(sessionCwd(session), workspaceTitle)
       const thread = this.dshThread(workspace, session)
       for (const event of events) this.projectEventInto(workspace, thread, event)
-      return structuredClone(thread)
+      return snapshot ? structuredClone(thread) : null
     }, { deferred: true })
   }
 
@@ -665,6 +668,18 @@ function projectableEvent(event) {
   }
 }
 
+/**
+ * Whether projecting this event can change the canvas at all. Mirrors the
+ * branches inside projectEventInto (title rewrite, tool-process folding, and
+ * everything projectableEvent can turn into a card) so background queuing can
+ * skip the rest before any mutation, snapshot or save is scheduled. Keep in
+ * sync with projectEventInto when a new projectable event type is added.
+ */
+function projectionRelevant(event) {
+  if (event.type === 'session/title' || event.type === 'tool/call' || event.type === 'tool/result') return true
+  return projectableEvent(event) !== null
+}
+
 function errorText(value) {
   if (typeof value === 'string') return value.trim() || null
   if (value === null || value === undefined || typeof value !== 'object') return null
@@ -755,13 +770,20 @@ export function apply(ctx, config) {
     // Forks inherit their parent's log. The canvas already represents that
     // history through the parent node, so only project the child's live tail.
     const replayFrom = session.header?.parentSession === undefined ? 0 : session.firstLiveSeq
-    void store.projectSession(session, replayFrom, projectionWorkspaceTitle).catch(reportProjectionFailure)
+    void store.projectSession(session, replayFrom, projectionWorkspaceTitle, { snapshot: false }).catch(reportProjectionFailure)
   }
   // Buffer live events per session and flush them in one write per microtask,
   // so a burst of turn events coalesces into a single save instead of N.
   const projectionQueue = []
   let projectionScheduled = false
   const enqueueProjection = (session, event) => {
+    // Events without any canvas representation (stream chunks, telemetry, …)
+    // must not enter the pipeline: each queued event schedules a mutation, a
+    // full-thread snapshot and — via markDirty — a whole-graph save, so a
+    // streamed reply would dirty the graph once per chunk. projectionRelevant
+    // mirrors the branches inside projectEventInto; new projectable event
+    // types must be added in both places or they are silently dropped here.
+    if (!projectionRelevant(event)) return
     projectionQueue.push({ session, event })
     if (projectionScheduled) return
     projectionScheduled = true
@@ -775,7 +797,7 @@ export function apply(ctx, config) {
         else entry[1].push(item.event)
       }
       for (const [sessionId, [session, events]] of bySession) {
-        void store.projectEvents(session, events, projectionWorkspaceTitle).catch(reportProjectionFailure)
+        void store.projectEvents(session, events, projectionWorkspaceTitle, { snapshot: false }).catch(reportProjectionFailure)
       }
     })
   }
