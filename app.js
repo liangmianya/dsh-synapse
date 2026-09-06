@@ -107,11 +107,36 @@ function resetCanvasCamera() {
   state.canvasCamera = { x: 0, y: 0 }
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, { ...options, headers: { 'content-type': 'application/json', ...(options.headers ?? {}) } })
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(body.error ?? '请求失败')
-  return body
+const pendingReads = new Map()
+let activeReads = 0
+const readWaiters = []
+async function acquireRead() {
+  if (activeReads >= 2) await new Promise(resolve => readWaiters.push(resolve))
+  else activeReads++
+}
+function releaseRead() {
+  const next = readWaiters.shift()
+  if (next) next()
+  else activeReads--
+}
+function api(path, options = {}) {
+  const read = (options.method ?? 'GET').toUpperCase() === 'GET'
+  if (read && pendingReads.has(path)) return pendingReads.get(path)
+  const request = (async () => {
+    if (read) await acquireRead()
+    try {
+      const response = await fetch(path, { ...options, headers: { 'content-type': 'application/json', ...(options.headers ?? {}) } })
+      const body = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(body.error ?? '请求失败')
+      return body
+    } finally { if (read) releaseRead() }
+  })()
+  if (!read) return request
+  // A list notification and the periodic refresh can request the same large
+  // projection concurrently. Share only in-flight reads; never cache stale data.
+  const pending = request.finally(() => { if (pendingReads.get(path) === pending) pendingReads.delete(path) })
+  pendingReads.set(path, pending)
+  return pending
 }
 
 function post(type, payload = {}) {
@@ -185,17 +210,27 @@ function workspaceChoices() {
 async function threadsForDshWorkspace(workspace) {
   if (workspace.sessionIds.length === 0) return []
   const requested = new Set(workspace.sessionIds)
-  const projections = await Promise.all(state.summaries.map(summary => api(`/synapse/api/workspaces/${summary.id}`)))
-  return projections.flatMap(projection => projection.workspace.threads.filter(thread => requested.has(thread.dshSessionId)))
+  // Aggregate one projection at a time instead of retaining every full
+  // workspace response and starting N large GETs for each map notification.
+  const threads = []
+  for (const summary of state.summaries) {
+    const projection = await api(`/synapse/api/workspaces/${summary.id}`)
+    threads.push(...projection.workspace.threads.filter(thread => requested.has(thread.dshSessionId)))
+  }
+  return threads
 }
 
+let failedWorkspaceLoad = false
 async function openDshWorkspace(id, { renderAfter = true, preserveCanvasCamera = false } = {}) {
   const workspace = state.dshWorkspaces.find(item => item.id === id)
   if (workspace === undefined) return false
   const load = ++state.workspaceLoad
   state.selectedDshWorkspaceId = id
-  const threads = await threadsForDshWorkspace(workspace)
+  let threads
+  try { threads = await threadsForDshWorkspace(workspace) }
+  catch (error) { if (load === state.workspaceLoad) failedWorkspaceLoad = true; throw error }
   if (load !== state.workspaceLoad) return true
+  failedWorkspaceLoad = false
   const nextWorkspaceId = `dsh:${workspace.id}`
   if (state.workspace?.id !== nextWorkspaceId && !preserveCanvasCamera) resetCanvasCamera()
   state.workspace = { id: nextWorkspaceId, title: workspace.title, cwd: workspace.path, threads }
@@ -222,10 +257,11 @@ async function refreshSummaries({ renderAfter = true } = {}) {
   const current = state.workspace?.id
   if (state.selectedDshWorkspaceId === null && current !== null && !state.summaries.some(item => item.id === current)) state.workspace = null
   const selected = selectedDshWorkspace()
-  if (selected !== undefined && (changed || state.workspace === null)) await openDshWorkspace(selected.id, { renderAfter })
+  const needsProjection = selected !== undefined && (changed || failedWorkspaceLoad || state.workspace?.id !== `dsh:${selected.id}`)
+  if (needsProjection) await openDshWorkspace(selected.id, { renderAfter })
   else if (state.workspace === null && state.summaries.length > 0) await openWorkspace(state.summaries[0].id)
   else if (renderAfter && changed && canReplaceView()) render()
-  return changed
+  return changed || needsProjection
 }
 
 async function openWorkspace(id, { renderAfter = true } = {}) {
@@ -243,7 +279,9 @@ async function openWorkspace(id, { renderAfter = true } = {}) {
 async function refreshProjection() {
   const summariesChanged = await refreshSummaries({ renderAfter: false })
   if (!summariesChanged || state.workspace === null || !canReplaceView()) return summariesChanged
-  if (state.selectedDshWorkspaceId !== null) await openDshWorkspace(state.selectedDshWorkspaceId)
+  // refreshSummaries already refreshed the selected DSH projection. Do not
+  // download every workspace a second time in the same polling iteration.
+  if (state.selectedDshWorkspaceId !== null) render()
   else await openWorkspace(state.workspace.id)
   return true
 }
@@ -1697,13 +1735,17 @@ window.addEventListener('message', event => {
     document.documentElement.dataset.theme = data.dark === true ? 'dark' : 'light'
   }
   if (data.type === 'synapse:workspaces') {
-    state.dshWorkspaces = Array.isArray(data.workspaces) ? data.workspaces.filter(workspace => typeof workspace?.id === 'string' && typeof workspace.title === 'string' && Array.isArray(workspace.sessionIds)) : []
+    const workspaces = Array.isArray(data.workspaces) ? data.workspaces.filter(workspace => typeof workspace?.id === 'string' && typeof workspace.title === 'string' && Array.isArray(workspace.sessionIds)) : []
+    if (JSON.stringify(workspaces) === JSON.stringify(state.dshWorkspaces)) return
+    const previousSelected = JSON.stringify(selectedDshWorkspace())
+    state.dshWorkspaces = workspaces
     const current = currentDshWorkspace()
     if (current !== undefined && current.id !== state.selectedDshWorkspaceId) void openDshWorkspace(current.id).catch(setError)
-    else if (state.selectedDshWorkspaceId !== null) void openDshWorkspace(state.selectedDshWorkspaceId).catch(setError)
+    else if (state.selectedDshWorkspaceId !== null && previousSelected !== JSON.stringify(selectedDshWorkspace())) void openDshWorkspace(state.selectedDshWorkspaceId).catch(setError)
     else if (canReplaceView()) render()
   }
   if (data.type === 'synapse:current-session') {
+    if (JSON.stringify(state.currentDsh) === JSON.stringify(data.session)) return
     const previousId = state.currentDsh?.id
     state.currentDsh = data.session
     const preserveCanvasCamera = previousId !== data.session?.id && state.mapCardSessionSwitches.delete(data.session?.id)
