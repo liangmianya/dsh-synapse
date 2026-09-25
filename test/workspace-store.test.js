@@ -5,6 +5,17 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { WorkspaceStore } from '../index.js'
 
+/**
+ * Doubles the host `Session` surface the store reads. v0.1.7 dropped the
+ * `session.events` getter for `snapshotEvents()`, moved the durable fork cut
+ * from `header.seedLength` to `inheritedEventCount`, and removed `header.meta`.
+ * @param fields - identity, header fields, and the recorded event log.
+ * @returns a session double exposing the current contract.
+ */
+function hostSession(fields) {
+  return { ...fields, snapshotEvents: () => fields.events ?? [] }
+}
+
 test('persists a workspace, a DSH-linked thread, and a message', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-'))
   const dataFile = join(directory, 'state.json')
@@ -23,19 +34,19 @@ test('persists a workspace, a DSH-linked thread, and a message', async () => {
 test('projects committed DSH events once, folds tool process into the assistant card, and keeps fork lineage', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-projection-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
-  const parent = {
-    id: 'session-parent', header: {}, firstLiveSeq: 0,
+  const parent = hostSession({
+    id: 'session-parent', header: {}, inheritedEventCount: 0,
     events: [
       { type: 'user/message', seq: 0, time: 1, data: { content: [{ type: 'text', text: '分析登录异常' }] } },
       { type: 'assistant/message', seq: 1, time: 2, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '我来检查。' }] } } },
       { type: 'tool/call', seq: 2, time: 3, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{"cmd":"pnpm test"}' } },
       { type: 'tool/result', seq: 3, time: 4, data: { turn: 1, step: 1, message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'ok' }] } } },
     ],
-  }
+  })
   await store.projectSession(parent)
   await store.projectEvent(parent, parent.events[2])
-  const child = { id: 'session-child', header: { parentSession: 'session-parent' }, firstLiveSeq: 4, events: [] }
-  await store.projectSession(child, child.firstLiveSeq)
+  const child = hostSession({ id: 'session-child', header: { parentSession: 'session-parent' }, inheritedEventCount: 4, events: [] })
+  await store.projectSession(child, child.inheritedEventCount)
 
   const [workspace] = await store.list()
   const graph = await store.get(workspace.id)
@@ -55,15 +66,15 @@ test('projects committed DSH events once, folds tool process into the assistant 
 test('projects a batch of session events in a single write', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-batch-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
-  const session = {
-    id: 'session-batch', header: { meta: { cwd: 'C:\\work\\batch' } }, firstLiveSeq: 0,
+  const session = hostSession({
+    id: 'session-batch', header: { cwd: 'C:\\work\\batch' }, inheritedEventCount: 0,
     events: [
       { type: 'user/message', seq: 0, time: 1, data: { content: [{ type: 'text', text: '批量问题' }] } },
       { type: 'assistant/message', seq: 1, time: 2, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '批量回答' }] } } },
       { type: 'tool/call', seq: 2, time: 3, data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{}' } },
       { type: 'tool/result', seq: 3, time: 4, data: { turn: 1, step: 1, message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'ok' }] } } },
     ],
-  }
+  })
   await store.projectEvents(session, session.events)
   const [workspace] = await store.list()
   const graph = await store.get(workspace.id)
@@ -78,15 +89,15 @@ test('projects a batch of session events in a single write', async () => {
 test('retains a tool failure and exposes a failed turn without assistant text', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-error-projection-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
-  await store.projectSession({
-    id: 'session-error', header: { meta: { cwd: 'C:\\work\\errors' } }, firstLiveSeq: 0,
+  await store.projectSession(hostSession({
+    id: 'session-error', header: { cwd: 'C:\\work\\errors' }, inheritedEventCount: 0,
     events: [
       { type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'text', text: '搜索竞品' }] } },
       { type: 'tool/call', seq: 2, time: 2, data: { turn: 7, step: 1, callId: 'search-1', name: 'web_search', arguments: '{"query":"竞品"}' } },
       { type: 'tool/result', seq: 3, time: 3, data: { turn: 7, step: 1, error: { name: 'QuotaExceeded', code: 'INSUFFICIENT_BALANCE', message: '余额不足' }, message: { source: { kind: 'tool', callId: 'search-1' }, content: [] } } },
       { type: 'turn/end', seq: 4, time: 4, data: { turn: 7, step: 1, reason: { kind: 'error', error: { name: 'QuotaExceeded', code: 'INSUFFICIENT_BALANCE', message: '余额不足' } } } },
     ],
-  })
+  }))
 
   const [workspace] = await store.list()
   const graph = await store.get(workspace.id)
@@ -138,14 +149,14 @@ test('migrates v3 tool cards into the assistant process records', async () => {
 test('does not persist the DSH runtime context as a user conversation turn', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-runtime-context-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
-  await store.projectSession({
-    id: 'runtime-context', header: { meta: { cwd: 'C:\\work\\canvas' } }, firstLiveSeq: 0,
+  await store.projectSession(hostSession({
+    id: 'runtime-context', header: { cwd: 'C:\\work\\canvas' }, inheritedEventCount: 0,
     events: [
       { type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'text', text: '你好' }] } },
       { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\\nPolicy.' }] } },
       { type: 'assistant/message', seq: 3, time: 3, data: { message: { content: [{ type: 'text', text: '你好，我是助手。' }] } } },
     ],
-  })
+  }))
 
   const [workspace] = await store.list()
   const graph = await store.get(workspace.id)
@@ -155,10 +166,10 @@ test('does not persist the DSH runtime context as a user conversation turn', asy
 test('merges a browser fork callback with an already projected DSH fork', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-fork-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
-  const parent = { id: 'parent', header: {}, firstLiveSeq: 0, events: [] }
-  const child = { id: 'child', header: { parentSession: 'parent' }, firstLiveSeq: 0, events: [] }
+  const parent = hostSession({ id: 'parent', header: {}, inheritedEventCount: 0, events: [] })
+  const child = hostSession({ id: 'child', header: { parentSession: 'parent' }, inheritedEventCount: 0, events: [] })
   const parentThread = await store.projectSession(parent)
-  await store.projectSession(child, child.firstLiveSeq)
+  await store.projectSession(child, child.inheritedEventCount)
   const merged = await store.branch(parentThread.id, { title: '替代方案', dshSessionId: 'child', dshSessionTitle: '替代方案' })
   const [workspace] = await store.list()
   const graph = await store.get(workspace.id)
@@ -170,8 +181,8 @@ test('merges a browser fork callback with an already projected DSH fork', async 
 test('groups DSH sessions by their working directory', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-cwd-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
-  await store.projectSession({ id: 'alpha', header: { meta: { cwd: 'C:\\work\\alpha' } }, firstLiveSeq: 0, events: [] })
-  await store.projectSession({ id: 'beta', header: { meta: { cwd: 'C:\\work\\beta' } }, firstLiveSeq: 0, events: [] })
+  await store.projectSession(hostSession({ id: 'alpha', header: { cwd: 'C:\\work\\alpha' }, inheritedEventCount: 0, events: [] }))
+  await store.projectSession(hostSession({ id: 'beta', header: { cwd: 'C:\\work\\beta' }, inheritedEventCount: 0, events: [] }))
   const workspaces = await store.list()
   assert.equal(workspaces.length, 2)
   assert.deepEqual(new Set(workspaces.map(workspace => workspace.cwd)), new Set(['C:\\work\\alpha', 'C:\\work\\beta']))
@@ -218,7 +229,7 @@ test('removes the canvas node when DSH removes the session', async () => {
 test('removing a DSH node prevents replay from restoring it', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-remove-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
-  const session = { id: 'remove-me', header: { meta: { cwd: 'C:\\work\\remove' } }, firstLiveSeq: 0, events: [] }
+  const session = hostSession({ id: 'remove-me', header: { cwd: 'C:\\work\\remove' }, inheritedEventCount: 0, events: [] })
   const thread = await store.projectSession(session)
   await store.removeThread(thread.id)
   await store.projectSession(session)
@@ -266,7 +277,7 @@ test('coalesces deferred projection saves into one write', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-debounce-'))
   const dataFile = join(directory, 'state.json')
   const store = new WorkspaceStore(dataFile)
-  const session = { id: 's1', header: { meta: { cwd: 'C:\\work\\x' } }, firstLiveSeq: 0 }
+  const session = hostSession({ id: 's1', header: { cwd: 'C:\\work\\x' }, inheritedEventCount: 0 })
   // Two deferred projections land inside one debounce window: no disk write yet.
   await store.projectEvents(session, [{ type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'text', text: 'a' }] } }])
   await store.projectEvents(session, [{ type: 'assistant/message', seq: 2, time: 2, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'b' }] } } }])
@@ -285,7 +296,7 @@ test('coalesces deferred projection saves into one write', async () => {
 test('truncates over-long projections with a detail-view marker', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-truncate-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
-  const session = { id: 's1', header: { meta: { cwd: 'C:\\work\\x' } }, firstLiveSeq: 0 }
+  const session = hostSession({ id: 's1', header: { cwd: 'C:\\work\\x' }, inheritedEventCount: 0 })
   await store.projectEvents(session, [
     { type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'text', text: '问' }] } },
     { type: 'assistant/message', seq: 2, time: 2, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'y'.repeat(9_000) }] } } },

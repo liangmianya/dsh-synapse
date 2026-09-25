@@ -2,12 +2,18 @@ window.__ModuleLoader__.load({
   id: 'dsh-synapse',
   factory: () => {
     const module = { exports: {} }
+    // Consumer identity for owned Session references. The Client records
+    // positive reference counts per source; nothing else reads this string.
+    const SESSION_SOURCE = 'synapse'
+    // Shown when a Session is gone or no longer reachable from this browser.
+    const NO_SESSION = '关联的 DSH 会话已不可用'
     const currentSession = ctx => {
       const snapshot = ctx.sessions.list.getSnapshot()
-      const id = snapshot.current
-      if (id === undefined) return null
-      const session = snapshot.byId[id]
-      return session === undefined ? null : { id, title: session.displayTitle, cwd: session.cwd ?? null }
+      // 0.1.7 removed `list.current`: the Main view's own reference count is the
+      // Client's current-Session signal. `ui-workspace` derives the highlighted
+      // Session row from the same fact, so both stay in step by construction.
+      const session = Object.values(snapshot.byId).find(row => (row.retainedBy?.mainView ?? 0) > 0)
+      return session === undefined ? null : { id: session.id, title: session.displayTitle, cwd: session.cwd ?? null }
     }
     const sessionSnapshot = ctx => {
       const snapshot = ctx.sessions.list.getSnapshot()
@@ -26,14 +32,25 @@ window.__ModuleLoader__.load({
       ]
     }
 
-    module.exports.inject = ['sessions', 'workspaces']
+    module.exports.inject = ['sessions', 'workspaces', 'uiWorkspace', 'uiConversation']
     module.exports.apply = ctx => {
       const prompt = async (sessionId, text) => {
-        const scope = ctx.sessions.scope(sessionId)
-        const session = scope === undefined ? undefined : ctx.sessions.sessionOf(scope)
-        if (session === undefined) throw new Error('关联的 DSH 会话已不可用')
-        const result = await session.prompt([{ type: 'text', text }], 'queue')
-        if (!result.ok) throw new Error(result.error?.message ?? 'DSH 未接受这条消息')
+        // 0.1.7 owns Session lifetime explicitly: `scope()` only borrows an
+        // already-retained generation, so sending needs a reference of our own.
+        let reference
+        try {
+          reference = ctx.sessions.retain(sessionId, { source: SESSION_SOURCE })
+          await reference.ready
+        } catch {
+          reference?.release()
+          throw new Error(NO_SESSION)
+        }
+        try {
+          const result = await reference.binding.session.prompt([{ type: 'text', text }], 'queue')
+          if (!result.ok) throw new Error(result.error?.message ?? 'DSH 未接受这条消息')
+        } finally {
+          reference.release()
+        }
       }
       const style = document.createElement('style')
       style.textContent = '.dsh-synapse-switch{position:fixed;z-index:80;top:12px;left:50%;display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d1d5db;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px)}.dsh-synapse-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#6b7280;font:600 12px Inter,system-ui,sans-serif;cursor:pointer;white-space:nowrap}.dsh-synapse-switch button:hover{background:#f3f4f6;color:#111827}.dsh-synapse-switch button.active{background:#111827;color:#fff}.dsh-synapse-switch button:focus-visible{outline:2px solid #111827;outline-offset:2px}.dsh-synapse-overlay{position:fixed;z-index:100;inset:0;background:#f5f7fa}.dsh-synapse-overlay.is-opening{visibility:hidden}.dsh-synapse-overlay[hidden]{display:none}.dsh-synapse-overlay iframe{display:block;width:100%;height:100%;border:0}'
@@ -64,25 +81,91 @@ window.__ModuleLoader__.load({
       const send = (type, payload) => { frame.contentWindow?.postMessage({ source: 'dsh-synapse', type, ...payload }, location.origin) }
       let syncQueued = false
       let knownSessionIds = new Set()
-      const liveUnsubscribers = new Map()
-      const syncLiveSessions = () => {
-        const snapshot = ctx.sessions.list.getSnapshot()
-        for (const id of snapshot.ids) {
-          if (liveUnsubscribers.has(id)) continue
-          const scope = ctx.sessions.scope(id)
-          const session = scope === undefined ? undefined : ctx.sessions.sessionOf(scope)
-          if (session === undefined) continue
-          const publish = () => {
-            if (overlay.hidden) return
-            const state = session.getSnapshot()
-            const text = state.partial?.blocks.filter(block => block.kind === 'text').map(block => block.text).join('\n') ?? ''
-            send('synapse:live-reply', { sessionId: id, running: state.running, text })
-          }
-          liveUnsubscribers.set(id, session.subscribe(publish))
-          publish()
-        }
-        for (const [id, unsubscribe] of liveUnsubscribers) if (!snapshot.ids.includes(id)) { unsubscribe(); liveUnsubscribers.delete(id) }
+      // One live record per catalogued Session. The pre-0.1.7 Client minted a
+      // Session scope on demand for any listed id, so live state was readable
+      // for every card; 0.1.7 mints none, so a Chat view is readable only while
+      // something holds a reference. A card whose Session is not observable
+      // still reports its `running` flag from the list row, because only the
+      // streaming text needs the view.
+      const liveSessions = new Map()
+      // References this plugin owns, so it can read a running Session's Chat
+      // view without depending on another surface retaining it.
+      const ownReferences = new Map()
+
+      const publishLiveSession = id => {
+        if (overlay.hidden) return
+        const text = liveSessions.get(id)?.chat?.getSnapshot()?.legacy.partial?.blocks
+          .filter(block => block.kind === 'text').map(block => block.text).join('\n') ?? ''
+        const running = ctx.sessions.list.getSnapshot().byId[id]?.running === true
+        send('synapse:live-reply', { sessionId: id, running, text })
       }
+
+      const detachLiveSession = record => {
+        for (const unsubscribe of record.unsubscribers) unsubscribe()
+      }
+
+      // A running Session is the only kind that produces live text, so it is the
+      // only kind worth opening a reference — and its history read — for.
+      const syncObservedSessions = () => {
+        const rows = ctx.sessions.list.getSnapshot()
+        for (const id of rows.ids) {
+          const held = ownReferences.has(id)
+          const wanted = rows.byId[id]?.running === true && ctx.sessions.binding(id) === undefined
+          if (wanted && !held) {
+            try {
+              const reference = ctx.sessions.retain(id, { source: SESSION_SOURCE })
+              void reference.ready.catch(() => {})
+              ownReferences.set(id, reference)
+            } catch { /* the Session is not retainable right now */ }
+          } else if (!wanted && held) {
+            ownReferences.get(id).release()
+            ownReferences.delete(id)
+          }
+        }
+        for (const [id, reference] of ownReferences) {
+          if (rows.ids.includes(id)) continue
+          reference.release()
+          ownReferences.delete(id)
+        }
+      }
+
+      const syncLiveSessions = () => {
+        syncObservedSessions()
+        const ids = ctx.sessions.list.getSnapshot().ids
+        for (const id of ids) {
+          const binding = ctx.sessions.binding(id)
+          let record = liveSessions.get(id)
+          // Rebuild when the observable source appears or disappears, and when a
+          // same-id generation replaced the borrowed binding.
+          if (record !== undefined && record.binding !== binding) {
+            detachLiveSession(record)
+            record = undefined
+          }
+          if (record === undefined) {
+            let chat
+            if (binding !== undefined) {
+              try { chat = ctx.uiConversation.binding(id).target('chat') } catch { chat = undefined }
+            }
+            liveSessions.set(id, {
+              binding,
+              chat,
+              // `target('chat')` is the only reader that activates the view
+              // target: its snapshot stays undefined until something subscribes.
+              unsubscribers: chat === undefined
+                ? []
+                : [chat.subscribe(() => publishLiveSession(id)), binding.session.subscribe(() => publishLiveSession(id))],
+            })
+          }
+        }
+        for (const [id, record] of liveSessions) {
+          if (ids.includes(id)) continue
+          detachLiveSession(record)
+          liveSessions.delete(id)
+        }
+      }
+      // Always runs after `syncLiveSessions`, so a newly attached Session gets
+      // its first report here rather than publishing twice on the same sync.
+      const publishLiveSessions = () => { for (const id of liveSessions.keys()) publishLiveSession(id) }
       const syncSessions = () => {
         if (syncQueued) return
         syncQueued = true
@@ -102,6 +185,7 @@ window.__ModuleLoader__.load({
       const syncCurrentSession = () => {
         syncSessions()
         syncLiveSessions()
+        publishLiveSessions()
         syncTheme()
         if (!overlay.hidden) {
           send('synapse:workspaces', { workspaces: workspaceSnapshot(ctx) })
@@ -144,26 +228,34 @@ window.__ModuleLoader__.load({
           return send('synapse:current-session', { session: currentSession(ctx) })
         }
         if (event.data.type === 'synapse:open-session') {
-          try { ctx.sessions.open(event.data.sessionId); close() } catch { send('synapse:bridge-error', { message: '关联的 DSH 会话已不可用' }) }
+          // 0.1.7 moved navigation out of the Session Controller: selecting a
+          // Session and showing its Conversation is one Workspace UI action.
+          try { ctx.uiWorkspace.openSession(event.data.sessionId); close() } catch { send('synapse:bridge-error', { message: NO_SESSION }) }
           // Best-effort anchor to the requested turn: chat nodes expose their
           // source event seq (anchorSeq) and render with data-chat-anchor-key,
           // so resolve seq -> node key -> scroll once the view materializes.
           const seq = event.data.seq
           if (Number.isInteger(seq)) {
             const tryScroll = attempt => {
-              const scope = ctx.sessions.scope(event.data.sessionId)
-              const session = scope === undefined ? undefined : ctx.sessions.sessionOf(scope)
-              if (session === undefined) return
-              const chat = session.getSnapshot()?.chat
-              if (chat === undefined) return
+              const record = liveSessions.get(event.data.sessionId)
+              if (record === undefined) {
+                if (attempt < 3) window.setTimeout(() => tryScroll(attempt + 1), 500)
+                return
+              }
               let key = undefined
-              for (const node of chat.nodes.values()) {
+              for (const node of record.chat.getSnapshot()?.nodes.values() ?? []) {
                 if (node.anchorSeq === seq) { key = node.key; break }
               }
               if (key !== undefined) {
                 const row = document.querySelector(`[data-chat-anchor-key="${CSS.escape(key)}"]`)
                 if (row instanceof HTMLElement) row.scrollIntoView({ block: 'start' })
                 return
+              }
+              // The requested turn may sit outside the loaded window; the jump
+              // loader pages history back through the seq, then the retry reads
+              // the rebuilt node set.
+              if (attempt === 0 && typeof record.session.loadThrough === 'function') {
+                void record.session.loadThrough(seq).catch(() => {})
               }
               if (attempt < 3) window.setTimeout(() => tryScroll(attempt + 1), 500)
             }
@@ -175,7 +267,7 @@ window.__ModuleLoader__.load({
           // Bidirectional current-session sync: switch DSH's current session
           // without closing the map; the sessions-list subscription re-sends
           // synapse:current-session so the map follows the new highlight.
-          try { ctx.sessions.open(event.data.sessionId) } catch { send('synapse:bridge-error', { message: '关联的 DSH 会话已不可用' }) }
+          try { ctx.uiWorkspace.openSession(event.data.sessionId) } catch { send('synapse:bridge-error', { message: NO_SESSION }) }
           return
         }
         if (event.data.type === 'synapse:fork-session') {
@@ -231,7 +323,10 @@ window.__ModuleLoader__.load({
         themeObserver?.disconnect()
         unsubscribeSessions()
         unsubscribeWorkspaces()
-        for (const unsubscribe of liveUnsubscribers.values()) unsubscribe()
+        for (const record of liveSessions.values()) detachLiveSession(record)
+        liveSessions.clear()
+        for (const reference of ownReferences.values()) reference.release()
+        ownReferences.clear()
         host.remove()
         style.remove()
       }, 'synapse: web workspace switch')

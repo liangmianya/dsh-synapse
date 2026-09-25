@@ -6,7 +6,7 @@ The plugin does not replace DSH models, tools, sessions, permissions, or the Web
 
 ## Prerequisites
 
-- A DeepSeek Harness release with the `dsh plugin` profile mechanism (2026-08 or later).
+- DeepSeek Harness `>= 0.1.7-rc.2`; this revision targets that release's Host session and Client service interfaces.
 - Node.js `>= 22.19.0`.
 - The `web` profile; other profiles are not currently supported.
 

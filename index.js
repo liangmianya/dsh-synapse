@@ -200,7 +200,11 @@ export class WorkspaceStore {
       if (this.state.hiddenSessionIds.includes(session.id)) return null
       const workspace = this.dshWorkspace(sessionCwd(session), workspaceTitle)
       const thread = this.dshThread(workspace, session)
-      for (const event of session.events) {
+      // `snapshotEvents()` replaces the removed `session.events` getter. It is
+      // marked deprecated because DSH is moving complete logs out of memory, but
+      // rebuilding this canvas from history needs the full sequence and the
+      // reader is the only complete-log access a plugin still has.
+      for (const event of session.snapshotEvents()) {
         if (event.seq >= replayFrom) this.projectEventInto(workspace, thread, event)
       }
       return structuredClone(thread)
@@ -380,9 +384,9 @@ export class WorkspaceStore {
         thread.title = title
         thread.dshSessionTitle = title
       }
-      // `seedLength` is DSH's durable fork cut. Keep it even after the
-      // session has been restored, when its in-process `firstLiveSeq` moves.
-      const seedLength = session.header?.seedLength
+      // `inheritedEventCount` is DSH's durable fork cut, the successor of the
+      // removed `header.seedLength`. It survives restore, unlike `firstLiveSeq`.
+      const seedLength = session.inheritedEventCount
       if (Number.isSafeInteger(seedLength) && seedLength >= 0) thread.sourceSeedLength = seedLength
       return thread
     }
@@ -395,7 +399,7 @@ export class WorkspaceStore {
       title: typeof session.title === 'string' && session.title.trim() !== '' ? session.title.slice(0, MAX_TITLE_LENGTH) : (parent === undefined ? 'DSH 会话' : `${parent.title} 分支`),
       parentId: parent?.id ?? null,
       sourceParentSessionId: parentSessionId,
-      sourceSeedLength: Number.isSafeInteger(session.header?.seedLength) && session.header.seedLength >= 0 ? session.header.seedLength : null,
+      sourceSeedLength: Number.isSafeInteger(session.inheritedEventCount) && session.inheritedEventCount >= 0 ? session.inheritedEventCount : null,
       dshSessionId: session.id,
       dshSessionTitle: typeof session.title === 'string' ? session.title.slice(0, MAX_TITLE_LENGTH) : null,
       color: TOPIC_COLORS[workspace.threads.length % TOPIC_COLORS.length],
@@ -706,7 +710,9 @@ function titleFromText(text) {
 }
 
 function sessionCwd(session) {
-  const cwd = session.header?.meta?.cwd ?? session.header?.cwd
+  // The Session header defines `cwd` as its only working-directory carrier; the
+  // old `header.meta.cwd` fallback never matched a real header field.
+  const cwd = session.header?.cwd
   return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : '未指定工作目录'
 }
 
@@ -753,8 +759,9 @@ export function apply(ctx, config) {
   }
   const replaySession = session => {
     // Forks inherit their parent's log. The canvas already represents that
-    // history through the parent node, so only project the child's live tail.
-    const replayFrom = session.header?.parentSession === undefined ? 0 : session.firstLiveSeq
+    // history through the parent node, so only project the child's live tail:
+    // `inheritedEventCount` is 0 without a fork and the durable cut with one.
+    const replayFrom = session.inheritedEventCount ?? 0
     void store.projectSession(session, replayFrom, projectionWorkspaceTitle).catch(reportProjectionFailure)
   }
   // Buffer live events per session and flush them in one write per microtask,

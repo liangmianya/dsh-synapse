@@ -5,6 +5,7 @@ This document covers local validation, package inspection, GitHub Actions, and n
 ## Requirements
 
 - Node.js `>= 22.19.0`
+- DeepSeek Harness `>= 0.1.7-rc.2` for integration runs; the test suite itself installs no Harness
 - pnpm through Corepack
 - A checkout of this repository
 

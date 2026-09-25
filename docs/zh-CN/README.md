@@ -6,7 +6,7 @@
 
 ## 前提条件
 
-- 支持 `dsh plugin` profile 插件机制的 DeepSeek Harness（2026-08 或之后版本）。
+- DeepSeek Harness `>= 0.1.7-rc.2`（本插件依赖该版本的 Host 会话与 Client 服务接口）。
 - Node.js `>= 22.19.0`。
 - 使用 `web` profile；其他 profile 暂不支持。
 

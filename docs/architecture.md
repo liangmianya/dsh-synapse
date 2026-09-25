@@ -28,6 +28,29 @@ DSH session logs remain the source of truth for conversation content and lifecyc
 
 Synapse projects committed DSH events into cards and sends user actions back through the native DSH session bridge.
 
+## Harness compatibility
+
+This revision is built and verified against DeepSeek Harness `0.1.7-rc.2`. Both halves call Harness APIs directly, so a Harness release that changes them requires a matching plugin release.
+
+Host half (`index.js`) calls:
+
+- `ctx.webServer.register({ kind, path, handler })`, the route registry of `@deepseek-ai/dsh-host-webserver`;
+- `ctx.sessions.list()`, the live `Session` objects of `@deepseek-ai/dsh-session`;
+- the untagged (global) `session/created` and `session/event` listeners;
+- `session.snapshotEvents()` for a projection replay, `session.inheritedEventCount` for the durable fork cut, and `session.header.cwd` for workspace grouping.
+
+Client half (`client.js`), through `dsh.client.inject` in `package.json`:
+
+- `sessions.list`, `sessions.binding`, `sessions.create`, `sessions.fork` from `@deepseek-ai/dsh-api-session-controller`, plus `sessions.retain`/`release` for two purposes: owning a reference across a prompt round-trip, and owning one for every *running* Session whose live reply the map mirrors, because no Harness release mints a Session scope implicitly any more and an unowned Session has no readable Chat view;
+- `workspaces.list` from `@deepseek-ai/dsh-api-workspace-controller`;
+- `uiWorkspace.openSession` from `@deepseek-ai/dsh-client-ui-workspace` for selecting a Session;
+- `uiConversation.binding(sessionId).target('chat')` from `@deepseek-ai/dsh-client-ui-conversation` for the streaming reply and the turn anchor index, because the Client builds a view snapshot only after something subscribes to its target. A Session the browser does not observe still reports its `running` flag, which the list row carries.
+
+Two Harness dependencies are worth re-checking on every upgrade:
+
+- `snapshotEvents()` is marked deprecated: Harness is moving complete session logs out of memory. Rebuilding this canvas from history needs the full sequence, so the call remains, and it needs a storage-backed successor (an asynchronous paged read) before Harness removes it.
+- The browser half must acquire its own `SessionReference` before sending a prompt; borrowing an Agent scope no longer opens one.
+
 ## Canvas metadata
 
 By default, Synapse stores canvas metadata at:

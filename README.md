@@ -22,7 +22,7 @@
 
 ## 快速安装
 
-需要支持 profile 插件机制的 DeepSeek Harness、Node.js `>= 22.19.0`，以及 `web` profile。
+需要 DeepSeek Harness `>= 0.1.7-rc.2`（本插件依赖该版本的 Host 会话与 Client 服务接口）、Node.js `>= 22.19.0`，以及 `web` profile。
 
 ```powershell
 corepack pnpm dsh plugin --profile web add dsh-synapse
