@@ -142,12 +142,18 @@ function settleRpc(requestId, value, error) {
 
 function setError(error = '') { state.error = error instanceof Error ? error.message : error; render() }
 
+function isInternalRuntimeMessage(text) {
+  if (typeof text !== 'string') return false
+  const normalized = text.trimStart()
+  return normalized.startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.') || normalized.startsWith('<system-reminder>')
+}
+
 function messagesFromEvents(events) {
   if (!Array.isArray(events)) return []
   return events.flatMap(event => {
     const content = event?.data?.message?.content ?? event?.data?.content
     const text = Array.isArray(content) ? content.filter(block => block?.type === 'text').map(block => block.text).filter(Boolean).join('\n') : ''
-    if (event?.type === 'user/message' && text && !text.startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')) return [{ kind: 'user', text, at: event.time, sourceSeq: event.seq }]
+    if (event?.type === 'user/message' && text && !isInternalRuntimeMessage(text)) return [{ kind: 'user', text, at: event.time, sourceSeq: event.seq }]
     if (event?.type === 'assistant/message' && text) return [{ kind: 'assistant', text, at: event.time, sourceSeq: event.seq }]
     return []
   })
@@ -408,10 +414,10 @@ function settlePendingReply(thread, messages) {
 }
 
 function messagesFor(thread) {
-  // A runtime-context snapshot is internal DSH state, never a user turn.
+  // Internal DSH context is never a user turn.
   // Filter here as well as during persistence so existing saved workspaces
   // immediately render one question and its answer as one card.
-  const messages = persistedMessagesFor(thread).filter(message => !(message.kind === 'user' && typeof message.text === 'string' && message.text.trimStart().startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')))
+  const messages = persistedMessagesFor(thread).filter(message => !(message.kind === 'user' && isInternalRuntimeMessage(message.text)))
   const pending = state.pendingReplies.get(thread.dshSessionId)
   if (pending === undefined) return messages
   if (settlePendingReply(thread, messages)) {
