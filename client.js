@@ -1,6 +1,6 @@
 window.__ModuleLoader__.load({
   id: 'dsh-synapse',
-  factory: () => {
+  factory: (require) => {
     const module = { exports: {} }
     // Consumer identity for owned Session references. The Client records
     // positive reference counts per source; nothing else reads this string.
@@ -53,7 +53,7 @@ window.__ModuleLoader__.load({
         }
       }
       const style = document.createElement('style')
-      style.textContent = '.dsh-synapse-switch{position:fixed;z-index:80;top:calc(var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) + 12px);left:50%;display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d1d5db;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px)}.dsh-synapse-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#6b7280;font:600 12px Inter,system-ui,sans-serif;cursor:pointer;white-space:nowrap}.dsh-synapse-switch button:hover{background:#f3f4f6;color:#111827}.dsh-synapse-switch button.active{background:#111827;color:#fff}.dsh-synapse-switch button:focus-visible{outline:2px solid #111827;outline-offset:2px}.dsh-synapse-overlay{position:fixed;z-index:100;inset:var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) 0 0 0;background:#f5f7fa}.dsh-synapse-overlay.is-opening{visibility:hidden}.dsh-synapse-overlay[hidden]{display:none}.dsh-synapse-overlay iframe{display:block;width:100%;height:100%;border:0}html[data-fullscreen] .dsh-synapse-overlay{top:0}html[data-fullscreen] .dsh-synapse-switch{top:12px}'
+      style.textContent = '.dsh-synapse-switch{position:fixed;z-index:80;top:calc(var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) + 12px);left:50%;display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d1d5db;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px)}.dsh-synapse-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#6b7280;font:600 12px Inter,system-ui,sans-serif;cursor:pointer;white-space:nowrap}.dsh-synapse-switch button:hover{background:#f3f4f6;color:#111827}.dsh-synapse-switch button.active{background:#111827;color:#fff}.dsh-synapse-switch button:focus-visible{outline:2px solid #111827;outline-offset:2px}.dsh-synapse-overlay{position:fixed;z-index:100;inset:var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) 0 0 0;background:#f5f7fa}.dsh-synapse-overlay.is-opening{visibility:hidden}.dsh-synapse-overlay[hidden]{display:none}.dsh-synapse-overlay iframe{display:block;width:100%;height:100%;border:0}html[data-fullscreen] .dsh-synapse-overlay{top:0}html[data-fullscreen] .dsh-synapse-switch{top:12px}.dsh-synapse-switch--slot{position:static;left:auto;top:auto;transform:none;z-index:auto;margin-right:6px}'
       document.head.append(style)
       const host = document.createElement('div')
       host.className = 'dsh-synapse-host'
@@ -63,6 +63,51 @@ window.__ModuleLoader__.load({
       const mapButton = host.querySelector('[data-view="map"]')
       const overlay = host.querySelector('.dsh-synapse-overlay')
       const frame = host.querySelector('iframe')
+
+      // Hosts that expose the Conversation header utilities slot let the switch
+      // take part in the header layout instead of floating over it. A pill
+      // centred on the viewport collides with the header's own content (title,
+      // lineage, agent-preset chips) as soon as that content grows; without the
+      // slot the fixed placement above stays the fallback.
+      const switchEl = host.querySelector('.dsh-synapse-switch')
+      let releaseSwitchSlot
+      const slots = typeof ctx.get === 'function' ? ctx.get('slots') : undefined
+      if (slots !== undefined && typeof require === 'function') {
+        // Once the switch has a seat in the Conversation header it must not also
+        // live on the page: a body-level fixed pill would float over every view
+        // where that header never mounts (plugins, settings, ...).
+        switchEl.remove()
+        try {
+          // The Client shell hands the factory a shared `require`; React may be
+          // the CJS object itself or wrapped as `default`, so accept both and
+          // fall back to the fixed placement when neither shape is usable.
+          const reactModule = require('react')
+          const React = typeof reactModule?.createElement === 'function' ? reactModule : reactModule?.default
+          if (typeof React?.createElement !== 'function') throw new Error('react is unavailable')
+          const SwitchCell = () => {
+            const ref = React.useRef(null)
+            React.useEffect(() => {
+              const cell = ref.current
+              if (cell === null) return undefined
+              cell.append(switchEl)
+              switchEl.classList.add('dsh-synapse-switch--slot')
+              return () => {
+                switchEl.classList.remove('dsh-synapse-switch--slot')
+                switchEl.remove()
+              }
+            }, [])
+            return React.createElement('div', { className: 'dsh-synapse-slot-cell', ref })
+          }
+          releaseSwitchSlot = slots.inject('conversation.session.header.utilities', () => slots.register({
+            name: 'conversation.session.header.utilities',
+            id: 'dsh-synapse-view-switch',
+            order: -10,
+          }, SwitchCell))
+        } catch {
+          // Slot service present but unusable: restore the fixed placement.
+          host.append(switchEl)
+        }
+      }
 
       const setView = view => {
         const showingMap = view === 'map'
@@ -327,6 +372,7 @@ window.__ModuleLoader__.load({
         liveSessions.clear()
         for (const reference of ownReferences.values()) reference.release()
         ownReferences.clear()
+        releaseSwitchSlot?.()
         host.remove()
         style.remove()
       }, 'synapse: web workspace switch')
