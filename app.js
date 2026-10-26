@@ -1081,7 +1081,7 @@ function syncCanvasViewport() {
 
 function renderCanvas() {
   const threads = visibleThreads(state.workspace?.threads ?? [])
-  if (threads.length === 0 && state.draft?.kind !== 'new') return `<section class="empty-canvas"><strong>当前工作目录还没有 DSH 对话。</strong><p>点击新会话，在画布中输入第一条消息。</p><div><button class="primary" type="button" data-action="create-session">新建会话</button></div></section>`
+  if (threads.length === 0 && state.draft?.kind !== 'new') return `<section class="empty-canvas" data-morph-key="empty-canvas"><strong>当前工作目录还没有 DSH 对话。</strong><p>点击新会话，在画布中输入第一条消息。</p><div><button class="primary" type="button" data-action="create-session">新建会话</button></div></section>`
   const allCards = conversationCards(threads)
   const graph = conversationGraphView(allCards)
   const cards = graph.cards
@@ -1103,7 +1103,7 @@ function renderCanvas() {
   state.mountedCardIds = new Set(visible)
   const mounted = cards.filter(card => visible.has(card.id))
   const inspector = state.inspectorCardId === null ? '' : renderCardInspector(state.canvasCardsById.get(state.inspectorCardId))
-  return `<section class="canvas-view"><div class="canvas-viewport"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors">${canvasConnectors(cards)}</svg><div class="cards-layer">${mounted.map(card => conversationCard(card, graph)).join('')}${draftCard(cards)}</div></div></div>${inspector}</section>`
+  return `<section class="canvas-view" data-morph-key="canvas-view"><div class="canvas-viewport"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors">${canvasConnectors(cards)}</svg><div class="cards-layer">${mounted.map(card => conversationCard(card, graph)).join('')}${draftCard(cards)}</div></div></div>${inspector}</section>`
 }
 
 function isProcessMessage(message) {
@@ -1230,7 +1230,7 @@ function renderThread() {
   const messages = messagesFor(thread)
   const waiting = state.pendingReplies.has(thread.dshSessionId)
   const latestAssistantSeq = [...messages].reverse().find(message => Number.isInteger(message.sourceSeq))?.sourceSeq
-  return `<section class="detail-view"><header class="detail-head"><div class="detail-head-title"><div class="detail-head-meta"><span class="detail-badge">${thread.parentId === null ? '会话' : '分支'}</span>${thread.dshSessionTitle ?? thread.title ? `<span class="detail-subtitle">${escapeHtml(thread.dshSessionTitle ?? thread.title)}</span>` : ''}</div><h1>${escapeHtml(questionFor(thread))}</h1></div><div class="detail-head-actions"><button data-action="open-dsh" data-thread="${thread.id}" data-seq="${Number.isInteger(latestAssistantSeq) ? latestAssistantSeq : ''}" title="在原生对话中打开此会话">在 DSH 中打开</button><button data-action="open-branch" data-thread="${thread.id}" title="基于最新回答创建分支">创建分支</button><button class="primary" data-action="show-canvas">返回画布</button></div></header><div class="detail-scroll">${messages.map(message => threadMessage(thread, message)).join('') || '<div class="note-empty">等待这条会话的第一条消息。</div>'}</div><form class="message-composer" data-compose="${thread.id}"><textarea maxlength="4000" placeholder="继续当前会话…" ${waiting ? 'disabled' : ''}></textarea><button class="primary" type="submit" ${waiting ? 'disabled' : ''}>${waiting ? '等待回复' : '发送'}</button></form></section>`
+  return `<section class="detail-view" data-morph-key="detail-view"><header class="detail-head"><div class="detail-head-title"><div class="detail-head-meta"><span class="detail-badge">${thread.parentId === null ? '会话' : '分支'}</span>${thread.dshSessionTitle ?? thread.title ? `<span class="detail-subtitle">${escapeHtml(thread.dshSessionTitle ?? thread.title)}</span>` : ''}</div><h1>${escapeHtml(questionFor(thread))}</h1></div><div class="detail-head-actions"><button data-action="open-dsh" data-thread="${thread.id}" data-seq="${Number.isInteger(latestAssistantSeq) ? latestAssistantSeq : ''}" title="在原生对话中打开此会话">在 DSH 中打开</button><button data-action="open-branch" data-thread="${thread.id}" title="基于最新回答创建分支">创建分支</button><button class="primary" data-action="show-canvas">返回画布</button></div></header><div class="detail-scroll">${messages.map(message => threadMessage(thread, message)).join('') || '<div class="note-empty">等待这条会话的第一条消息。</div>'}</div><form class="message-composer" data-compose="${thread.id}"><textarea maxlength="4000" placeholder="继续当前会话…" ${waiting ? 'disabled' : ''}></textarea><button class="primary" type="submit" ${waiting ? 'disabled' : ''}>${waiting ? '等待回复' : '发送'}</button></form></section>`
 }
 
 function render() {
@@ -1425,12 +1425,23 @@ function applyCanvasTransform() {
 // whatever sits under the pointer stays alive.
 
 const MORPH_KEY_ATTRIBUTES = ['data-morph-key', 'data-card-id', 'data-thread', 'id']
+// `data-thread` labels every control inside a card: the footer's 详情 / DSH /
+// 归档 buttons and the card's 追问 / 分支 buttons all carry the same thread id.
+// Used alone it is not a key — two siblings would match one live node, the
+// second patch would overwrite the first, and the losing buttons would be
+// dropped as unmatched. The action they trigger is what tells them apart.
+const MORPH_KEY_DISCRIMINATORS = ['data-action', 'data-card', 'data-seq']
 
 function morphKeyOf(node) {
   if (!(node instanceof Element)) return null
   for (const attribute of MORPH_KEY_ATTRIBUTES) {
     const value = node.getAttribute(attribute)
-    if (value !== null && value !== '') return `${node.tagName}|${attribute}|${value}`
+    if (value === null || value === '') continue
+    const parts = [`${node.tagName}|${attribute}|${value}`]
+    if (attribute === 'data-thread') {
+      for (const extra of MORPH_KEY_DISCRIMINATORS) parts.push(node.getAttribute(extra) ?? '')
+    }
+    return parts.join('|')
   }
   return null
 }
@@ -1438,11 +1449,14 @@ function morphKeyOf(node) {
 /** An element that owns the caret keeps its children untouched. */
 function morphHoldsCaret(node) {
   if (!(node instanceof Element)) return false
+  // Freeze exactly the element that holds the caret. Anything wider is fatal:
+  // `node.contains(activeElement)` made `<main>` a caret owner as soon as the
+  // composer or a draft textarea took focus, so every render skipped the whole
+  // shell and the page stopped updating while the state kept changing — clicks
+  // looked dead. A plain text selection must not freeze the canvas either.
   if (node === document.activeElement) return true
-  const selection = typeof window.getSelection === 'function' ? window.getSelection() : null
-  if (selection === null || selection.rangeCount === 0) return false
-  const anchor = selection.anchorNode
-  return anchor !== null && node.contains(anchor)
+  const active = document.activeElement
+  return active instanceof HTMLElement && active.isContentEditable === true && active.contains(node)
 }
 
 function morphNode(from, to) {
@@ -1483,6 +1497,9 @@ function morphChildren(from, to) {
   for (const next of [...to.childNodes]) {
     const key = morphKeyOf(next)
     let match = key === null ? null : keyed.get(key) ?? null
+    // One live node may serve one slot only. Without this a duplicated key
+    // would patch the same node twice and delete the leftovers.
+    if (match !== null) keyed.delete(key)
     if (match === null && cursor !== null && morphKeyOf(cursor) === null) match = cursor
     if (match === null) {
       const inserted = next.cloneNode(true)

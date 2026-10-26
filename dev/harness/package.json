@@ -1,0 +1,12 @@
+{
+  "name": "dsh-synapse-harness",
+  "private": true,
+  "type": "module",
+  "description": "Click-level smoke test for the Synapse map: boots the real Host half and drives the real app.js in jsdom, no DSH install required.",
+  "scripts": {
+    "test": "node click.mjs"
+  },
+  "dependencies": {
+    "jsdom": "^25.0.1"
+  }
+}

@@ -1,3 +1,4 @@
 node_modules/
 *.tgz
 .pack-check/
+dev/harness/package-lock.json
