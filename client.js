@@ -77,11 +77,36 @@ window.__ModuleLoader__.load({
       //     rightward (title, lineage and agent-preset chips). Half the sidebar
       //     width puts the pill over the centre of the content area instead of
       //     the window; `min()` pulls it back in on narrow windows.
-      style.textContent = '.dsh-synapse-switch{position:fixed;z-index:200;top:calc(var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) + 12px);left:min(calc(50% + 130px),calc(100% - 96px));display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d1d5db;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px);-webkit-app-region:no-drag;box-shadow:0 2px 8px rgba(17,24,39,.1)}.dsh-synapse-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#6b7280;font:600 12px Inter,system-ui,sans-serif;cursor:pointer;white-space:nowrap;-webkit-app-region:no-drag}.dsh-synapse-switch button:hover{background:#f3f4f6;color:#111827}.dsh-synapse-switch button.active{background:#111827;color:#fff}.dsh-synapse-switch button:focus-visible{outline:2px solid #111827;outline-offset:2px}.dsh-synapse-overlay{position:fixed;z-index:100;inset:var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) 0 0 0;background:#f5f7fa}.dsh-synapse-overlay.is-opening{visibility:hidden}.dsh-synapse-overlay[hidden]{display:none}.dsh-synapse-overlay iframe{display:block;width:100%;height:100%;border:0}html[data-fullscreen] .dsh-synapse-overlay{top:0}html[data-fullscreen] .dsh-synapse-switch{top:12px}'
+      // Colours below are the host app's own tokens (design-platform.css): border-l2,
+// label-secondary, interactive-bg-hover, alias-brand-primary. The pill sits on
+// DSH chrome, so it has to match DSH, not this plugin's accent.
+      // One rule per line: the pill's geometry and its motion are read together.
+      style.textContent = `
+.dsh-synapse-switch{position:fixed;z-index:200;top:calc(var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) + 12px);left:min(calc(50% + 130px),calc(100% - 96px));display:flex;gap:2px;padding:3px;transform:translateX(-50%);border:1px solid rgba(0,0,0,.12);border-radius:999px;background:rgba(255,255,255,.96);backdrop-filter:blur(10px);-webkit-app-region:no-drag;box-shadow:0 2px 8px rgba(15,17,21,.1)}
+/* One travelling thumb instead of two painted buttons: switching views should
+   read as the fill moving over, not as two labels swapping colours. The bridge
+   measures it (moveThumb) because the labels are different widths; width:0
+   means it stays invisible until that measurement happens. */
+.dsh-synapse-switch-thumb{position:absolute;top:3px;bottom:3px;left:3px;width:0;border-radius:999px;background:#0f1115;pointer-events:none;transition:transform 260ms cubic-bezier(.22,1,.32,1),width 260ms cubic-bezier(.22,1,.32,1)}
+.dsh-synapse-switch button{position:relative;z-index:1;height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#61666b;font:600 12px Inter,system-ui,sans-serif;cursor:pointer;white-space:nowrap;-webkit-app-region:no-drag;transition:color 160ms ease}
+.dsh-synapse-switch button:hover:not(.active){background:#f9fafb;color:#0f1115}
+.dsh-synapse-switch button.active{color:#fff}
+.dsh-synapse-switch button:focus-visible{outline:2px solid #0f1115;outline-offset:2px}
+.dsh-synapse-overlay{position:fixed;z-index:100;inset:var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) 0 0 0;background:#f9fafb}
+/* is-opening hides the iframe until the map reports its first frame, so the
+   canvas never flashes at scroll 0; the fade is what replaces the hard cut. */
+.dsh-synapse-overlay.is-opening{visibility:hidden}
+.dsh-synapse-overlay[hidden]{display:none}
+.dsh-synapse-overlay iframe{display:block;width:100%;height:100%;border:0;transition:opacity 150ms ease}
+.dsh-synapse-overlay.is-opening iframe{opacity:0}
+html[data-fullscreen] .dsh-synapse-overlay{top:0}
+html[data-fullscreen] .dsh-synapse-switch{top:12px}
+@media (prefers-reduced-motion: reduce){.dsh-synapse-switch-thumb,.dsh-synapse-overlay iframe{transition:none}}
+      `
       document.head.append(style)
       const host = document.createElement('div')
       host.className = 'dsh-synapse-host'
-      host.innerHTML = '<div class="dsh-synapse-switch" role="group" aria-label="视图切换"><button type="button" data-view="dialog" class="active" aria-pressed="true">对话</button><button type="button" data-view="map" aria-pressed="false">会话地图</button></div><section class="dsh-synapse-overlay" hidden><iframe title="会话地图" src="/synapse/"></iframe></section>'
+      host.innerHTML = '<div class="dsh-synapse-switch" data-active="dialog" role="group" aria-label="视图切换"><span class="dsh-synapse-switch-thumb" aria-hidden="true"></span><button type="button" data-view="dialog" class="active" aria-pressed="true">对话</button><button type="button" data-view="map" aria-pressed="false">会话地图</button></div><section class="dsh-synapse-overlay" hidden><iframe title="会话地图" src="/synapse/"></iframe></section>'
       document.body.append(host)
       const switchEl = host.querySelector('.dsh-synapse-switch')
       // Two live instances (a bundle loaded twice, or a sibling that outlived a
@@ -108,12 +133,38 @@ window.__ModuleLoader__.load({
       const overlay = host.querySelector('.dsh-synapse-overlay')
       const frame = host.querySelector('iframe')
 
+      // The pill's dark fill is one thumb that travels between the two labels,
+      // so entering the map looks like something moved rather than like two
+      // labels swapping colours. It is measured instead of assumed because the
+      // labels differ in width; `dialogButton`'s left edge is the thumb's
+      // resting origin, which keeps the arithmetic free of border/padding
+      // constants. A layout-less environment (the test double) simply leaves the
+      // thumb at zero width instead of throwing.
+      const thumb = host.querySelector('.dsh-synapse-switch-thumb')
+      let thumbPlaced = false
+      const moveThumb = () => {
+        const target = mapButton.classList.contains('active') ? mapButton : dialogButton
+        if (typeof target.getBoundingClientRect !== 'function' || typeof dialogButton.getBoundingClientRect !== 'function') return
+        const box = target.getBoundingClientRect()
+        if (box.width === 0) return
+        // The very first placement is the mount, not a switch: it must not
+        // animate (the thumb would visibly grow out of nothing on page load).
+        if (!thumbPlaced) thumb.style.transition = 'none'
+        thumb.style.width = `${box.width}px`
+        thumb.style.transform = `translateX(${Math.round(box.left - dialogButton.getBoundingClientRect().left)}px)`
+        if (!thumbPlaced) {
+          thumbPlaced = true
+          window.requestAnimationFrame(() => { thumb.style.transition = '' })
+        }
+      }
       const setView = view => {
         const showingMap = view === 'map'
         dialogButton.classList.toggle('active', !showingMap)
         dialogButton.setAttribute('aria-pressed', String(!showingMap))
         mapButton.classList.toggle('active', showingMap)
         mapButton.setAttribute('aria-pressed', String(showingMap))
+        switchEl.dataset.active = view
+        moveThumb()
       }
       const close = () => {
         window.clearTimeout(mapOpenFallback)
@@ -379,12 +430,18 @@ window.__ModuleLoader__.load({
       frame.addEventListener('load', onFrameLoad)
       window.addEventListener('message', onMessage)
       window.addEventListener('keydown', onKeyDown)
+      window.addEventListener('resize', moveThumb)
+      // The labels are laid out in the page's own font, so the first measurement
+      // has to happen after it settles (and again once a webfont swaps in).
+      moveThumb()
+      document.fonts?.ready?.then?.(() => moveThumb())
       ctx.effect(() => () => {
         dialogButton.removeEventListener('click', close)
         mapButton.removeEventListener('click', open)
         frame.removeEventListener('load', onFrameLoad)
         window.removeEventListener('message', onMessage)
         window.removeEventListener('keydown', onKeyDown)
+        window.removeEventListener('resize', moveThumb)
         themeObserver?.disconnect()
         unsubscribeSessions()
         unsubscribeWorkspaces()
