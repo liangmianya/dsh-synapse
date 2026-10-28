@@ -81,7 +81,7 @@ window.__ModuleLoader__.load({
       document.head.append(style)
       const host = document.createElement('div')
       host.className = 'dsh-synapse-host'
-      host.innerHTML = '<div class="dsh-synapse-switch" role="group" aria-label="视图切换"><button type="button" data-view="dialog" class="active" aria-pressed="true">对话</button><button type="button" data-view="map" aria-pressed="false">会话地图</button></div><section class="dsh-synapse-overlay" hidden><iframe title="会话地图" src="/synapse/"></iframe></section>'
+      host.innerHTML = '<div class="dsh-synapse-switch" role="group" aria-label="视图切换"><button type="button" data-view="dialog" class="active" aria-pressed="true">对话</button><button type="button" data-view="map" aria-pressed="false">会话地图</button></div><section class="dsh-synapse-overlay" hidden><iframe title="会话地图" src="/synapse/?v=2026082119"></iframe></section>'
       document.body.append(host)
       const switchEl = host.querySelector('.dsh-synapse-switch')
       // Two live instances (a bundle loaded twice, or a sibling that outlived a
