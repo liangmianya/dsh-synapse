@@ -139,6 +139,7 @@ async function loadBridge(options = {}) {
   const calls = { retain: [], released: [], prompts: [], opened: [], created: [], forked: [], archived: [], fetches: [], subscriptions: 0 }
   const posted = []
   const listListeners = new Set()
+  const notifyList = () => { for (const listener of [...listListeners]) listener() }
   const workspaceListeners = new Set()
   const chatListeners = new Set()
   const sessionListeners = new Set()
@@ -193,16 +194,22 @@ async function loadBridge(options = {}) {
     retain: (id, retainOptions) => {
       if (!rows.has(id)) throw new Error(`unknown session ${id}`)
       record(calls.retain, { id, ...retainOptions })
+      if (calls.retain.length > 100) throw new Error('retain loop')
       retained.add(id)
+      const binding = bindingOf(id)
+      // The real controller republishes the row's `retainedBy` through
+      // `list.set`, which notifies subscribers before `retain` returns.
+      notifyList()
       return {
         sessionId: id,
-        binding: bindingOf(id),
+        binding,
         ready: Promise.resolve(),
         release: () => {
           record(calls.released, id)
           retained.delete(id)
           // Retiring the generation retires its binding object.
           bindings.delete(id)
+          notifyList()
         },
       }
     },
@@ -354,7 +361,7 @@ async function loadBridge(options = {}) {
     overlay: () => shell.querySelector('.dsh-synapse-overlay'),
     anchorScrolled: () => anchorScrolled,
     chatChanged: () => { for (const listener of [...chatListeners]) listener() },
-    listChanged: () => { for (const listener of [...listListeners]) listener() },
+    listChanged: notifyList,
     sessionChanged: () => { for (const listener of [...sessionListeners]) listener() },
     postedOf: type => posted.filter(message => message.type === type),
   }
@@ -530,6 +537,18 @@ test('releases its own reference once the Session stops running', async () => {
 
   assert.deepEqual(bridge.calls.released, ['session-bg'])
   assert.deepEqual(bridge.postedOf('synapse:live-reply').at(-1), { source: 'dsh-synapse', type: 'synapse:live-reply', sessionId: 'session-bg', running: false, text: '' })
+})
+
+test('keeps one reference to a running Session across list updates', async () => {
+  const bridge = await loadBridge({ sessions: [sessionRow('session-bg', { running: true })] })
+  bridge.message({ type: 'synapse:map-ready' })
+  bridge.listChanged()
+  bridge.listChanged()
+
+  // Its own binding must not read as another view's, or each update would
+  // release the reference and the next would retain it again.
+  assert.deepEqual(bridge.calls.retain, [{ id: 'session-bg', source: 'synapse' }])
+  assert.deepEqual(bridge.calls.released, [])
 })
 
 test('still reports a running Session whose Chat view is unavailable', async () => {
