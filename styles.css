@@ -448,3 +448,26 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 [data-theme="dark"] button.primary { border-color: #3478f6; background: #3478f6; color: #fff; }
 [data-theme="dark"] button.primary:hover { border-color: #2563eb; background: #2563eb; color: #fff; }
 @media (max-width: 760px) { [data-theme="dark"] .card-inspector { border-top-color: #2a2d33; border-left: 0; } }
+
+/* ── Fenced code: token colours ────────────────────────────────────────────
+   `codeBlock()` in app.js wraps every coloured run in a `<span class="tok-*>`;
+   these eight classes are the whole vocabulary, so a new language never needs a
+   stylesheet change. Values are JetBrains' default schemes — IntelliJ Light
+   here, Darcula below — because a fenced block reads like an editor, and the
+   app's own greys cannot tell `const` from "value". */
+.tok-key { color: #0033b3; }   /* keyword */
+.tok-str { color: #067d17; }   /* string */
+.tok-num { color: #1750eb; }   /* number, colour literal */
+.tok-com { color: #8c8c8c; font-style: italic; }
+.tok-fn { color: #00627a; }    /* call */
+.tok-type { color: #871094; }  /* class, type, primitive */
+.tok-tag { color: #0033b3; }   /* markup tag */
+.tok-attr { color: #174ad4; }  /* markup attribute */
+[data-theme="dark"] .tok-key { color: #cc7832; }
+[data-theme="dark"] .tok-str { color: #6a8759; }
+[data-theme="dark"] .tok-num { color: #6897bb; }
+[data-theme="dark"] .tok-com { color: #808080; }
+[data-theme="dark"] .tok-fn { color: #ffc66d; }
+[data-theme="dark"] .tok-type { color: #9876aa; }
+[data-theme="dark"] .tok-tag { color: #e8bf6a; }
+[data-theme="dark"] .tok-attr { color: #bababa; }

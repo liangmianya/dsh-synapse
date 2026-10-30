@@ -534,6 +534,214 @@ const isTableDelimiter = line => {
   return cells.length > 0 && cells.every(cell => /^:?-+:?$/.test(cell))
 }
 
+// ── Code colouring ────────────────────────────────────────────────────────
+// A fence is the one place in an answer where colour carries meaning, so it
+// gets a small single-pass tokenizer instead of a dependency: comments,
+// strings, numbers, words, and markup brackets. Nothing is parsed into a tree
+// and nothing is ever emitted unescaped — a token is `escapeHtml` of a slice of
+// the original text, wrapped in a span. The palette (tokens.css, `--syn-tok-*`)
+// copies JetBrains' own default schemes, IntelliJ Light and Darcula, because
+// that is the editor most readers already have open next to the answer.
+const CODE_FAMILY = {
+  // C-like: the braced languages. Adding one here is the whole job — the
+  // tokenizer only needs the family, never per-language rules.
+  js: 'script', mjs: 'script', cjs: 'script', jsx: 'script', ts: 'script', tsx: 'script',
+  javascript: 'script', typescript: 'script',
+  java: 'script', kt: 'script', kts: 'script', kotlin: 'script', scala: 'script',
+  groovy: 'script', gradle: 'script', cs: 'script', csharp: 'script', 'c#': 'script',
+  c: 'script', h: 'script', m: 'script', cc: 'script', cpp: 'script', cxx: 'script',
+  hpp: 'script', hh: 'script', 'c++': 'script', objc: 'script', objectivec: 'script',
+  go: 'script', golang: 'script', rs: 'script', rust: 'script', swift: 'script',
+  dart: 'script', php: 'script', fs: 'script', fsharp: 'script', vb: 'script',
+  zig: 'script', nim: 'script', sol: 'script', solidity: 'script',
+  json: 'data', jsonc: 'data', json5: 'data', yaml: 'data', yml: 'data', toml: 'data',
+  ini: 'data', conf: 'data', properties: 'data',
+  py: 'hash', python: 'hash', rb: 'hash', ruby: 'hash', pl: 'hash', perl: 'hash',
+  r: 'hash', jl: 'hash', julia: 'hash', ex: 'hash', exs: 'hash', elixir: 'hash',
+  sh: 'hash', bash: 'hash', zsh: 'hash', fish: 'hash', shell: 'hash', console: 'hash',
+  powershell: 'hash', ps1: 'hash', dockerfile: 'hash', makefile: 'hash', dotenv: 'hash',
+  sql: 'dash', lua: 'dash',
+  css: 'css', scss: 'css', sass: 'css', less: 'css', stylus: 'css',
+  html: 'markup', htm: 'markup', xml: 'markup', svg: 'markup', vue: 'markup',
+}
+// Fences that are output, not source: colouring them would paint ordinary
+// words as keywords. Anything else unknown still gets the C-like default,
+// because a missing alias must never be the reason a block stays flat.
+const CODE_PLAIN = new Set('text txt plain plaintext log logs output diff patch csv tsv md markdown mermaid ascii art'.split(' '))
+const CODE_WORDS = {
+  script: new Set('abstract as assert async await break case catch class const continue crate debugger declare default delete do else enum export extends final finally fn for from function get if impl implements import in instanceof interface let loop mod mut native new of package private protected pub public readonly return satisfies set static super switch synchronized this throw throws trait transient try type typeof unsafe use var void volatile where while with yield'.split(' ')),
+  hash: new Set('and as assert async await break case class continue def del elif else esac eval except exec exit export fi finally for from function global if import in is lambda local nonlocal not or pass raise readonly return select set source then try unless until while with yield fi done do'.split(' ')),
+  dash: new Set('add all alter and as asc begin by cascade case check column commit constraint create default delete desc distinct drop else elseif end exists foreign from full function group having if in index inner insert into join key left limit nil not null offset on or order outer primary procedure references right rollback select table then trigger union unique update values view when where'.split(' ')),
+  data: new Set('true false null yes no on off'.split(' ')),
+  css: new Set(),
+  markup: new Set(),
+}
+// Lowercase primitives read as types, not keywords (IDEA colours them as a
+// class reference rather than an orange `const`).
+const CODE_PRIMITIVES = new Set('string number boolean object any unknown never bigint symbol int long double float char byte short'.split(' '))
+const codeToken = (kind, text) => `<span class="tok-${kind}">${escapeHtml(text)}</span>`
+
+/** ` </name attr="value" > `: only the name, the attributes and their values. */
+function markupTag(tag) {
+  const match = /^(<\/?)([\w:.-]+)([\s\S]*)$/.exec(tag)
+  if (match === null) return escapeHtml(tag)
+  let out = `${escapeHtml(match[1])}${codeToken('tag', match[2])}`
+  const attributes = /(\s*)([\w:.-]+)(?:(\s*=\s*)("[^"]*"|'[^']*'|[^\s>]+))?/g
+  let tail = 0
+  for (const found of match[3].matchAll(attributes)) {
+    out += escapeHtml(match[3].slice(tail, found.index)) + escapeHtml(found[1]) + codeToken('attr', found[2])
+    if (found[3] !== undefined) out += escapeHtml(found[3])
+    if (found[4] !== undefined) out += codeToken('str', found[4])
+    tail = found.index + found[0].length
+  }
+  return out + escapeHtml(match[3].slice(tail))
+}
+
+function highlightMarkup(text) {
+  let out = ''
+  let index = 0
+  while (index < text.length) {
+    const open = text.indexOf('<', index)
+    if (open === -1) return out + escapeHtml(text.slice(index))
+    if (open > index) out += escapeHtml(text.slice(index, open))
+    if (text.startsWith('<!--', open)) {
+      const close = text.indexOf('-->', open + 4)
+      const stop = close === -1 ? text.length : close + 3
+      out += codeToken('com', text.slice(open, stop))
+      index = stop
+      continue
+    }
+    const close = text.indexOf('>', open)
+    if (close === -1) return out + escapeHtml(text.slice(open))
+    out += markupTag(text.slice(open, close + 1))
+    index = close + 1
+  }
+  return out
+}
+
+/**
+ * Colours one fenced block. `language` is the fence tag as written. Only the
+ * output-shaped tags (`text`, `diff`, `log`, …) are left flat; everything else,
+ * including a tag this table has never heard of, gets the C-like default — a
+ * missing alias must never be why a block of Java stays monochrome.
+ * @param text - the block body, exactly as written.
+ * @param language - fence info string.
+ * @returns escaped HTML with `tok-*` spans.
+ */
+function highlightCode(text, language) {
+  const label = String(language ?? '').trim().toLowerCase()
+  if (CODE_PLAIN.has(label)) return escapeHtml(text)
+  const family = CODE_FAMILY[label] ?? 'script'
+  if (family === 'markup') return highlightMarkup(text)
+  const words = CODE_WORDS[family]
+  const lineComment = family === 'css' ? null : family === 'hash' ? '#' : family === 'dash' ? '--' : '//'
+  const word = /[A-Za-z_$][\w$]*/y
+  const number = /(?:0[xXbBoO][\da-fA-F_]+|\d[\d_]*(?:\.\d+)?(?:[eE][+-]?\d+)?)[a-zA-Z%_]*/y
+  const length = text.length
+  let out = ''
+  let index = 0
+  // The next character that is not a space or a tab — enough to tell `name(`
+  // (a call) from `name:` (a key) without copying the rest of the block.
+  const peek = at => {
+    while (at < length && (text[at] === ' ' || text[at] === '\t')) at++
+    return text[at]
+  }
+  while (index < length) {
+    const character = text[index]
+    if (lineComment !== null && text.startsWith(lineComment, index)) {
+      const newline = text.indexOf('\n', index)
+      const stop = newline === -1 ? length : newline
+      out += codeToken('com', text.slice(index, stop))
+      index = stop
+      continue
+    }
+    if (text.startsWith('/*', index)) {
+      const close = text.indexOf('*/', index + 2)
+      const stop = close === -1 ? length : close + 2
+      out += codeToken('com', text.slice(index, stop))
+      index = stop
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      const triple = family === 'hash' && text.startsWith(character.repeat(3), index)
+      const quote = triple ? character.repeat(3) : character
+      let stop = index + quote.length
+      while (stop < length) {
+        if (text[stop] === '\\') { stop += 2; continue }
+        if (text.startsWith(quote, stop)) { stop += quote.length; break }
+        // A plain quote ends at the line; a template literal may wrap.
+        if (!triple && quote !== '`' && text[stop] === '\n') break
+        stop++
+      }
+      // In JSON/YAML/TOML the string before a colon is a key, not a value.
+      const isKey = family === 'data' && peek(stop) === ':'
+      out += codeToken(isKey ? 'key' : 'str', text.slice(index, stop))
+      index = stop
+      continue
+    }
+    if (family === 'css' && character === '#') {
+      const colour = /#[0-9a-fA-F]{3,8}\b/y
+      colour.lastIndex = index
+      const found = colour.exec(text)
+      if (found !== null) {
+        out += codeToken('num', found[0])
+        index += found[0].length
+        continue
+      }
+    }
+    // `@media`, `$brand`, `--custom-property`: CSS names its own things.
+    if (family === 'css' && (character === '@' || character === '$')) {
+      const directive = /[@$][\w-]*/y
+      directive.lastIndex = index
+      const found = directive.exec(text)
+      if (found !== null) {
+        out += codeToken('key', found[0])
+        index += found[0].length
+        continue
+      }
+    }
+    if (character >= '0' && character <= '9' && (index === 0 || !/[\w$.]/.test(text[index - 1]))) {
+      number.lastIndex = index
+      const found = number.exec(text)
+      if (found !== null) {
+        out += codeToken('num', found[0])
+        index += found[0].length
+        continue
+      }
+    }
+    word.lastIndex = index
+    const found = word.exec(text)
+    if (found !== null) {
+      const value = found[0]
+      const after = peek(index + value.length)
+      let kind = null
+      if (family === 'css' && after === ':') kind = 'key'
+      else if (words.has(value)) kind = 'key'
+      else if (CODE_PRIMITIVES.has(value) && family === 'script') kind = 'type'
+      else if (after === '(') kind = 'fn'
+      else if (/^[A-Z]/.test(value)) kind = 'type'
+      out += kind === null ? escapeHtml(value) : codeToken(kind, value)
+      index += value.length
+      continue
+    }
+    out += escapeHtml(character)
+    index++
+  }
+  return out
+}
+
+/**
+ * One fenced block. The info string ("js", "java", …) picks the tokenizer and is
+ * kept as `data-lang`, so a stylesheet can label the block later.
+ */
+function codeBlock(part) {
+  const match = /^([\w+#.-]*)\n?/.exec(part)
+  const language = match === null ? '' : match[1]
+  const body = match === null ? part : part.slice(match[0].length)
+  const label = language === '' ? '' : ` data-lang="${escapeHtml(language)}"`
+  return `<pre${label}><code>${highlightCode(body, language)}</code></pre>`
+}
+
 function markdownBlock(text) {
   const lines = text.split('\n')
   const output = []
@@ -596,7 +804,7 @@ function renderMarkdown(text) {
   if (cached !== undefined) return cached
   const parts = key.split(/```/)
   const rendered = parts.map((part, index) => index % 2 === 1
-    ? `<pre><code>${escapeHtml(part.replace(/^\w*\n/, ''))}</code></pre>`
+    ? codeBlock(part)
     : markdownBlock(part)).join('')
   if (markdownCache.size >= MARKDOWN_CACHE_LIMIT) markdownCache.delete(markdownCache.keys().next().value)
   markdownCache.set(key, rendered)
