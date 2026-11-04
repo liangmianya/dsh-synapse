@@ -261,7 +261,9 @@ window.__ModuleLoader__.load({
         const rows = ctx.sessions.list.getSnapshot()
         for (const id of rows.ids) {
           const held = ownReferences.has(id)
-          const wanted = rows.byId[id]?.running === true && ctx.sessions.binding(id) === undefined
+          // Retaining creates the binding, so a binding this plugin holds does not
+          // count as another view of the Session.
+          const wanted = rows.byId[id]?.running === true && (held || ctx.sessions.binding(id) === undefined)
           if (wanted && !held) {
             try {
               const reference = ctx.sessions.retain(id, { source: SESSION_SOURCE })
@@ -269,14 +271,17 @@ window.__ModuleLoader__.load({
               ownReferences.set(id, reference)
             } catch { /* the Session is not retainable right now */ }
           } else if (!wanted && held) {
-            ownReferences.get(id).release()
+            // Forget the reference first: release() republishes the list, which
+            // re-enters this function synchronously.
+            const reference = ownReferences.get(id)
             ownReferences.delete(id)
+            reference.release()
           }
         }
         for (const [id, reference] of ownReferences) {
           if (rows.ids.includes(id)) continue
-          reference.release()
           ownReferences.delete(id)
+          reference.release()
         }
       }
 
