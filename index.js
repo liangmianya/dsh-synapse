@@ -22,16 +22,22 @@ const MAX_BODY_CHARS = 200_000
 const PROJECTION_TRUNCATED_SUFFIX = '\n——…（详情查看全文）'
 const BODY_TRUNCATED_SUFFIX = '\n——…（正文过长，其余请在 DSH 中查看）'
 const TOPIC_COLORS = ['#0f766e', '#2563eb', '#be123c', '#7c3aed', '#b45309']
-// The harness writes `user/message` rows of its own (runtime snapshots, skill
-// catalogues). A canvas card must stand for a turn a person actually typed, so
-// an injected row is recognised by its structured `source.kind` instead of by
-// guessing at the prose (issue #31 / #23).
-const INJECTED_USER_SOURCE_KINDS = new Set(['skill-catalog'])
-// Stored projections keep no raw event to re-read, so the one-time cleanup
-// recognises a legacy catalogue card by the markers only that injection emits:
-// the `<system-reminder>` opener plus the `<available_skills>` index it wraps.
-const SKILL_CATALOG_OPENER = '<system-reminder>'
-const SKILL_CATALOG_MARKER = '<available_skills>'
+// The harness writes `user/message` rows of its own: the workspace instruction
+// baseline (`agent-instructions`), the session snapshot (`runtime-context`), the
+// skill catalogue (`skill-catalog`) and the per-turn time snapshot
+// (`time-context`). A canvas card must stand for a turn a person actually typed,
+// so only `source.kind === 'user'` is projected and every other kind is
+// harness-authored (issue #31 / #23 / #57). Listing the injected kinds instead
+// meant each new kind leaked a phantom card that also swallowed the answer of
+// the real question. Legacy logs and imported transcripts carry no `source` at
+// all, so an absent kind keeps projecting.
+const REAL_USER_SOURCE_KIND = 'user'
+// Stored projections keep no raw event to re-read, so the load-time cleanup
+// recognises a harness row by the openers only an injection emits: the
+// `<system-reminder>` wrapper around every reminder, and the time snapshot's own
+// first line.
+const HARNESS_REMINDER_OPENER = '<system-reminder>'
+const TIME_SNAPSHOT_OPENER = 'Time sampled while preparing turn'
 const LOCK_STALE_MS = 60_000
 // Deferred (event-projection) writes coalesce into one save per window, so a
 // burst of session events costs a single full-state write instead of one per
@@ -758,7 +764,7 @@ function eventKind(event) {
 function eventBody(event) {
   switch (event?.type) {
     case 'user/message': return contentText(event.data?.content)
-    case 'assistant/message': return contentText(event.data?.message?.content)
+    case 'assistant/message': return answerText(event.data?.message?.content)
     case 'todo/write': return Array.isArray(event.data?.todos) ? event.data.todos.map(todo => `[${todo.status}] ${todo.content}`).join('\n') : ''
     case 'turn/end': {
       const reason = event.data?.reason
@@ -775,7 +781,11 @@ function projectableEvent(event) {
   if (kind === null) return null
   const text = eventBody(event)
   if (kind === 'user' && (isInjectedUserSource(event.data?.source) || isRuntimeContextText(text))) return null
-  return noteProjection(kind, text)
+  // An agent step that only calls tools carries no prose of its own. Keep the row
+  // so its `tool/call` records still fold into it (the card counts `工具 N`), but
+  // the canvas picks its answer from a step that actually wrote something.
+  if (kind === 'assistant' && text.trim() === '' && !hasToolCallPart(event.data?.message?.content)) return null
+  return noteProjection(kind, text, kind === 'assistant')
 }
 
 /**
@@ -920,9 +930,9 @@ function errorText(value) {
   return [name, code].filter(Boolean).join(': ') || null
 }
 
-function noteProjection(kind, text) {
+function noteProjection(kind, text, allowEmpty = false) {
   const normalized = text.trim()
-  if (normalized === '') return null
+  if (normalized === '' && !allowEmpty) return null
   const excerpt = excerptOf(normalized)
   return { kind, text: excerpt, length: normalized.length, truncated: excerpt.length < normalized.length }
 }
@@ -943,25 +953,27 @@ function isRuntimeContextMessage(message) {
 
 /** A harness-authored turn, identified by its structured provenance. */
 function isInjectedUserSource(source) {
-  return typeof source?.kind === 'string' && INJECTED_USER_SOURCE_KINDS.has(source.kind)
+  return typeof source?.kind === 'string' && source.kind !== REAL_USER_SOURCE_KIND
 }
 
 /**
- * Recognises a stored skill catalogue. Only the harness emits both markers
- * together, so a person quoting one of them is still kept as a real turn.
+ * Recognises a stored harness row. Only the harness writes these openers, and a
+ * person who quotes one still keeps the rest of the question, so the check stays
+ * on the leading text.
  */
-function isSkillCatalogText(text) {
+function isStoredInjectionText(text) {
   if (typeof text !== 'string') return false
   const head = text.trimStart()
-  return head.startsWith(SKILL_CATALOG_OPENER) && head.includes(SKILL_CATALOG_MARKER)
+  return head.startsWith(HARNESS_REMINDER_OPENER) || head.startsWith(TIME_SNAPSHOT_OPENER)
 }
 
 /**
- * Whether a stored message must stay out of the canvas graph: runtime
- * snapshots and skill catalogues were never a turn the user took.
+ * Whether a stored message must stay out of the canvas graph: runtime snapshots,
+ * workspace instructions, time snapshots and skill catalogues were never a turn
+ * the user took.
  */
 function isInjectedUserMessage(message) {
-  return message?.kind === 'user' && (isRuntimeContextMessage(message) || isSkillCatalogText(message.text))
+  return message?.kind === 'user' && (isRuntimeContextMessage(message) || isStoredInjectionText(message.text))
 }
 
 function contentText(content) {
@@ -972,6 +984,22 @@ function contentText(content) {
     if (block?.type === 'tool-result') return contentText(block.content)
     return []
   }).filter(value => typeof value === 'string' && value.trim() !== '').join('\n')
+}
+
+/**
+ * Prose only. A tool call folds into the reply it belongs to (`工具 N`), so
+ * stringifying its name and arguments here used to turn one agent step into a
+ * fake answer body — `pwsh\n{"command":…}` showed up as the reply text (#9 / #57).
+ */
+function answerText(content) {
+  if (!Array.isArray(content)) return ''
+  return content.flatMap(block => block?.type === 'text' ? [block.text] : [])
+    .filter(value => typeof value === 'string' && value.trim() !== '').join('\n')
+}
+
+/** Does this assistant message carry tool calls to fold, even without prose? */
+function hasToolCallPart(content) {
+  return Array.isArray(content) && content.some(block => block?.type === 'tool-call')
 }
 
 function titleFromText(text) {

@@ -188,6 +188,32 @@ test('does not persist the DSH runtime context as a user conversation turn', asy
   assert.deepEqual(graph.threads[0].messages.map(message => message.text), ['你好', '你好，我是助手。'])
 })
 
+test('projects a typed turn, not the harness instruction, runtime and time rows', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-injected-kinds-'))
+  const store = new WorkspaceStore(join(directory, 'state.json'))
+  await store.projectSession(hostSession({
+    id: 'injected-kinds', header: { cwd: 'C:\\work\\canvas' }, inheritedEventCount: 0,
+    events: [
+      { type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'text', text: '我记得你看k1里面有讲了几个' }], source: { kind: 'user', rpcId: 'r-1' } } },
+      { type: 'user/message', seq: 2, time: 2, data: { content: [{ type: 'text', text: '<system-reminder>\nThe following workspace instructions may be relevant' }], source: { kind: 'agent-instructions', form: 'instructions' } } },
+      { type: 'user/message', seq: 3, time: 3, data: { content: [{ type: 'text', text: '<system-reminder>\nThe following information describes your current session' }], source: { kind: 'runtime-context', form: 'snapshot' } } },
+      { type: 'user/message', seq: 4, time: 4, data: { content: [{ type: 'text', text: 'Time sampled while preparing turn 1, step 1: 2026-11-14T19:01:24+08:00[Asia/Shanghai]' }], source: { kind: 'time-context', form: 'snapshot' } } },
+      { type: 'tool/call', seq: 5, time: 5, data: { callId: 'call-1', name: 'pwsh', turn: 1, step: 1, arguments: '{"command":"ls"}' } },
+      { type: 'assistant/message', seq: 6, time: 6, data: { turn: 1, step: 1, message: { content: [{ type: 'reasoning', text: 'think' }, { type: 'tool-call', name: 'pwsh', arguments: '{"command":"ls"}' }] } } },
+      { type: 'assistant/message', seq: 7, time: 7, data: { turn: 1, step: 2, message: { content: [{ type: 'text', text: 'README 里是 8 个。' }] } } },
+    ],
+  }))
+
+  const [workspace] = await store.list()
+  const thread = (await store.get(workspace.id)).threads[0]
+  // One card, one answer: the injected rows never open a turn, and the tool-only
+  // step keeps an empty body so its tool call still folds into the turn.
+  assert.deepEqual(thread.messages.map(message => message.kind), ['user', 'assistant', 'assistant'])
+  assert.deepEqual(thread.messages.map(message => message.text), ['我记得你看k1里面有讲了几个', '', 'README 里是 8 个。'])
+  assert.deepEqual(thread.messages[1].process.map(entry => entry.name), ['pwsh'])
+  assert.equal(thread.title, '我记得你看k1里面有讲了几个')
+})
+
 test('skips the harness skill catalogue instead of projecting it as a question', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-skill-catalog-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))
@@ -232,6 +258,7 @@ test('drops a stored skill catalogue card on load and rewrites the file', async 
           { id: 'm-1', kind: 'user', text: '真实提问', sourceSeq: 1, at, process: [] },
           { id: 'm-2', kind: 'user', text: '<system-reminder>\nA skill is a reusable set.<available_skills>- `x`</available_skills>', sourceSeq: 2, at, process: [] },
           { id: 'm-3', kind: 'assistant', text: '回答', sourceSeq: 3, at, process: [] },
+          { id: 'm-4', kind: 'user', text: 'Time sampled while preparing turn 1, step 1: 2026-11-14T19:01:24+08:00[Asia/Shanghai]', sourceSeq: 4, at, process: [] },
         ],
       }],
     }],
