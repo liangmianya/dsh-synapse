@@ -151,10 +151,31 @@ function messagesFromEvents(events) {
   return events.flatMap(event => {
     const content = event?.data?.message?.content ?? event?.data?.content
     const text = Array.isArray(content) ? content.filter(block => block?.type === 'text').map(block => block.text).filter(Boolean).join('\n') : ''
-    if (event?.type === 'user/message' && text && !text.startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')) return [{ kind: 'user', text, at: event.time, sourceSeq: event.seq }]
+    if (event?.type === 'user/message' && text && !isHarnessUserRow(event, text)) return [{ kind: 'user', text, at: event.time, sourceSeq: event.seq }]
     if (event?.type === 'assistant/message' && text) return [{ kind: 'assistant', text, at: event.time, sourceSeq: event.seq }]
     return []
   })
+}
+
+/**
+ * A card stands for a turn a person typed. The harness writes `user/message`
+ * rows of its own (workspace instructions, runtime and time snapshots, the skill
+ * catalogue) and marks them with a `source.kind` other than `user`; older logs
+ * and imported transcripts carry no `source` at all, so an absent kind still
+ * counts as a real turn (`#57`).
+ */
+function isHarnessUserRow(event, text) {
+  const kind = event?.data?.source?.kind
+  if (typeof kind === 'string' && kind !== 'user') return true
+  return isHarnessUserText(text)
+}
+
+function isHarnessUserText(text) {
+  if (typeof text !== 'string') return false
+  const head = text.trimStart()
+  return head.startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')
+    || head.startsWith('<system-reminder>')
+    || head.startsWith('Time sampled while preparing turn')
 }
 
 async function loadThreadHistory() {}
@@ -493,7 +514,7 @@ function messagesFor(thread) {
   // A runtime-context snapshot is internal DSH state, never a user turn.
   // Filter here as well as during persistence so existing saved workspaces
   // immediately render one question and its answer as one card.
-  const stored = persistedMessagesFor(thread).filter(message => !(message.kind === 'user' && typeof message.text === 'string' && message.text.trimStart().startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')))
+  const stored = persistedMessagesFor(thread).filter(message => !(message.kind === 'user' && isHarnessUserText(message.text)))
   // Swap in hydrated bodies where present: the stored text is only a preview.
   const bodies = state.bodies.get(thread.id)
   const messages = bodies === undefined || bodies.size === 0
@@ -517,7 +538,9 @@ function messagesFor(thread) {
 
 function latestMessage(thread, kind) { return [...messagesFor(thread)].reverse().find(message => message.kind === kind) }
 function questionFor(thread) { return latestMessage(thread, 'user')?.text ?? thread.dshSessionTitle ?? '等待用户提问' }
-function answerFor(thread) { return latestMessage(thread, 'assistant') ?? null }
+function answerFor(thread) {
+  return [...messagesFor(thread)].reverse().find(message => message.kind === 'assistant' && (message.pending === true || (typeof message.text === 'string' && message.text.trim() !== ''))) ?? null
+}
 
 function inlineMarkdown(text) {
   return escapeHtml(text)
@@ -768,7 +791,10 @@ function conversationCards(threads) {
         if (Array.isArray(reply.process)) processCount += reply.process.length
         else if (reply.kind === 'tool') processCount += 1
       }
-      const answer = replies.at(-1) ?? null
+      // The answer is the last step that actually wrote prose. A step that only
+      // called tools keeps its folded process on the turn (that is where `工具 N`
+      // comes from) but must never become the card's body (#9 / #57).
+      const answer = replies.filter(reply => reply.pending === true || (typeof reply.text === 'string' && reply.text.trim() !== '')).at(-1) ?? null
       const error = errors.at(-1) ?? null
       const turnIndex = turns.length
       const id = `${thread.id}:turn:${question.sourceSeq ?? messageIndex}`

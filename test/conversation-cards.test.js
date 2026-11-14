@@ -36,6 +36,23 @@ test('projects each user question in one DSH session as a connected canvas card'
   assert.equal(cards[1].canContinue, true)
 })
 
+test('keeps the prose answer when the turn ends on a tool-only step', async () => {
+  const { conversationCards } = await loadConversationCards()
+  const [card] = conversationCards([{
+    id: 'session-tools', parentId: null, position: { x: 86, y: 82 },
+    messages: [
+      { kind: 'user', text: '列一下目录', sourceSeq: 1 },
+      { kind: 'assistant', text: '我先看看目录里有什么。', sourceSeq: 2, process: [{ callId: 'call-1', name: 'pwsh', status: 'done' }] },
+      { kind: 'assistant', text: '', sourceSeq: 3, process: [{ callId: 'call-2', name: 'glob', status: 'done' }] },
+    ],
+  }])
+
+  // The tool-only step still counts towards `工具 N`, but the card body stays the
+  // last step that actually wrote prose instead of `glob {"pattern":…}`.
+  assert.equal(card.answer.text, '我先看看目录里有什么。')
+  assert.equal(card.processCount, 2)
+})
+
 test('keeps a failed turn visible when Harness produces no assistant message', async () => {
   const { conversationCards } = await loadConversationCards()
   const [card] = conversationCards([{
