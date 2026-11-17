@@ -12,8 +12,10 @@
   },
   "files": [
     "index.js",
+    "session-bodies.js",
     "client.js",
     "app.js",
+    "browser-cache.js",
     "deepseek-mark.svg",
     "styles.css",
     "docs",
@@ -22,7 +24,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "node --check index.js && node --check client.js && node --check app.js",
+    "build": "node --check index.js && node --check session-bodies.js && node --check client.js && node --check browser-cache.js && node --check app.js",
     "prepare": "pnpm run build",
     "test": "node --test test/*.test.js"
   },

@@ -262,11 +262,12 @@ test('caches markdown rendering and patches the live card without a full render'
   const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
   const live = source.slice(source.indexOf('function scheduleLiveCardUpdate'), source.indexOf('async function pollProjection'))
 
-  assert.match(source, /const markdownCache = new Map\(\)/)
+  assert.match(source, /const markdownCache = new SynapseCache\.ByteLru/)
   assert.match(source, /MARKDOWN_CACHE_LIMIT/)
   assert.match(source, /function scheduleLiveCardUpdate/)
   assert.match(live, /function applyLiveReplyToCard/)
   assert.match(live, /requestAnimationFrame/)
+  assert.match(live, /renderMarkdown\(text, false\)/)
 })
 
 test('renders a follow-up plus on final cards and fold plus branch controls on non-final cards', async () => {

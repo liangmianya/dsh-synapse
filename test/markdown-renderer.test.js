@@ -5,11 +5,12 @@ import test from 'node:test'
 
 async function loadRenderer() {
   const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
-  const start = source.indexOf('const escapeHtml')
-  const end = source.indexOf('function canvasConnectors')
+  const helpers = await readFile(new URL('../browser-cache.js', import.meta.url), 'utf8')
+  const escape = source.slice(source.indexOf('const escapeHtml'), source.indexOf('const formatTime'))
+  const renderer = source.slice(source.indexOf('function inlineMarkdown'), source.indexOf('function overlapsCard'))
   const context = { globalThis: {} }
   vm.createContext(context)
-  vm.runInContext(`${source.slice(start, end)};globalThis.renderMarkdown = renderMarkdown`, context)
+  vm.runInContext(`${helpers}\n${escape}\n${renderer};globalThis.renderMarkdown = renderMarkdown`, context)
   return context.globalThis.renderMarkdown
 }
 

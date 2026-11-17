@@ -371,6 +371,7 @@ test('mounts one switch and one hidden map overlay into the page', async () => {
 
   assert.equal(bridge.shell().className, 'dsh-synapse-host')
   assert.equal(bridge.overlay().hidden, true)
+  assert.equal(bridge.postedOf('synapse:map-closed').length, 1)
 })
 
 test('derives the current session from the Main view reference count', async () => {
@@ -405,7 +406,7 @@ test('syncs every catalogued session to the canvas endpoint', async () => {
   bridge.message({ type: 'synapse:map-ready' })
   await new Promise(resolve => setTimeout(resolve, 0))
 
-  assert.equal(bridge.calls.fetches[0].url, '/synapse/api/sessions/sync')
+  assert.equal(new URL(bridge.calls.fetches[0].url, `${ORIGIN}/`).href, `${ORIGIN}/synapse/api/sessions/sync`)
   assert.deepEqual(bridge.calls.fetches[0].body.sessions, [
     { id: 'session-a', title: 'A', cwd: '/a', parentId: null, blank: false },
     { id: 'session-b', title: 'B', cwd: '/a', parentId: 'session-a', blank: true },

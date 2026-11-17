@@ -1,7 +1,9 @@
-import { copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
+import { constants as fsConstants } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { zstdDecompressSync } from 'node:zlib'
+import { BODY_LIMITS, LogLimitError, SessionLogReader, bodiesFromEvents, bodyPage, bodySelection, previewBody } from './session-bodies.js'
+export { SessionLogReader, bodiesFromEvents, decodeSessionLog } from './session-bodies.js'
 
 export const name = 'synapse'
 export const inject = ['webServer', 'sessions']
@@ -16,22 +18,13 @@ const MAX_NOTE_LENGTH = 4_000
 // grow to megabytes (issue #42). Bodies are streamed back on demand by
 // `/synapse/api/threads/:id/full`.
 const EXCERPT_CHARS = 280
-// On-demand bodies are capped so a single enormous tool result cannot stall the
-// browser while its card is rendered.
-const MAX_BODY_CHARS = 200_000
 const PROJECTION_TRUNCATED_SUFFIX = '\n——…（详情查看全文）'
-const BODY_TRUNCATED_SUFFIX = '\n——…（正文过长，其余请在 DSH 中查看）'
 const TOPIC_COLORS = ['#0f766e', '#2563eb', '#be123c', '#7c3aed', '#b45309']
 // The harness writes `user/message` rows of its own (runtime snapshots, skill
 // catalogues). A canvas card must stand for a turn a person actually typed, so
 // an injected row is recognised by its structured `source.kind` instead of by
 // guessing at the prose (issue #31 / #23).
-const INJECTED_USER_SOURCE_KINDS = new Set(['skill-catalog'])
-// Stored projections keep no raw event to re-read, so the one-time cleanup
-// recognises a legacy catalogue card by the markers only that injection emits:
-// the `<system-reminder>` opener plus the `<available_skills>` index it wraps.
-const SKILL_CATALOG_OPENER = '<system-reminder>'
-const SKILL_CATALOG_MARKER = '<available_skills>'
+const PROJECTION_VERSION = 2
 const LOCK_STALE_MS = 60_000
 // Deferred (event-projection) writes coalesce into one save per window, so a
 // burst of session events costs a single full-state write instead of one per
@@ -64,11 +57,27 @@ export class WorkspaceStore {
     return structuredClone(workspace)
   }
 
+  /** DSH groups by session membership, independently of Synapse's cwd groups. */
+  async threadsForSessions(sessionIds) {
+    if (!Array.isArray(sessionIds) || sessionIds.some(id => typeof id !== 'string' || id.trim() === '')) throw new InputError('sessionIds 必须是非空字符串数组')
+    await this.ready
+    const requested = new Set(sessionIds)
+    const threads = []
+    for (const workspace of this.state.workspaces) {
+      for (const thread of workspace.threads) {
+        if (requested.has(thread.dshSessionId)) threads.push(thread)
+      }
+    }
+    // Sessions without a projection simply contribute no matches.
+    // Clone only matches, so unrelated workspaces never enter the response.
+    return structuredClone(threads)
+  }
+
   /**
    * Read-only lookup used by on-demand body loading: returns the live thread
    * (no clone) together with its workspace, or null when the id is unknown.
    */
-  async locateThread(threadId) {
+  async readThread(threadId) {
     await this.ready
     for (const workspace of this.state.workspaces) {
       for (const thread of workspace.threads ?? []) {
@@ -150,11 +159,21 @@ export class WorkspaceStore {
       if (!Array.isArray(removedSessionIds) || removedSessionIds.some(item => typeof item !== 'string')) throw new InputError('removedSessionIds 必须是字符串数组')
       const blankIds = new Set(sessions.filter(item => item?.blank === true && typeof item.id === 'string').map(item => item.id))
       const removedIds = new Set(removedSessionIds)
+      let changed = false
       for (const workspace of this.state.workspaces) {
         if (workspace.kind !== 'dsh') continue
-        workspace.threads = workspace.threads.filter(thread => !blankIds.has(thread.dshSessionId) && !removedIds.has(thread.dshSessionId))
+        if (blankIds.size === 0 && removedIds.size === 0) continue
+        const threads = workspace.threads.filter(thread => !blankIds.has(thread.dshSessionId) && !removedIds.has(thread.dshSessionId))
+        if (threads.length === workspace.threads.length) continue
+        workspace.threads = threads
+        workspace.updatedAt = new Date().toISOString()
+        changed = true
       }
-      this.state.workspaces = this.state.workspaces.filter(workspace => workspace.kind !== 'dsh' || workspace.threads.length > 0)
+      const workspaces = this.state.workspaces.filter(workspace => workspace.kind !== 'dsh' || workspace.threads.length > 0)
+      if (workspaces.length !== this.state.workspaces.length) {
+        this.state.workspaces = workspaces
+        changed = true
+      }
       for (const item of sessions) {
         if (typeof item?.id !== 'string' || item.id === '' || typeof item.cwd !== 'string' || item.cwd === '') continue
         if (item.blank === true) continue
@@ -162,15 +181,12 @@ export class WorkspaceStore {
         // must not recreate a session that the user deliberately archived.
         if (this.state.hiddenSessionIds.includes(item.id)) continue
         const workspace = this.dshWorkspace(item.cwd, 'DSH 任务')
-        const session = { id: item.id, header: { meta: { cwd: item.cwd }, parentSession: typeof item.parentId === 'string' ? item.parentId : undefined }, title: typeof item.title === 'string' ? item.title : undefined, events: [] }
-        const thread = this.dshThread(workspace, session)
-        if (typeof item.title === 'string' && item.title.trim() !== '') {
-          thread.title = item.title.slice(0, MAX_TITLE_LENGTH)
-          thread.dshSessionTitle = thread.title
-        }
+        const session = { id: item.id, header: { cwd: item.cwd, parentSession: typeof item.parentId === 'string' ? item.parentId : undefined }, title: typeof item.title === 'string' ? item.title : undefined }
+        const result = this.dshThread(workspace, session)
+        changed = result.changed || changed
       }
-      return this.list()
-    }, { deferred: true })
+      return { changed, value: this.state.workspaces.map(workspace => this.summary(workspace)) }
+    }, { deferred: true, trackChanges: true })
   }
 
   async addMessage(threadId, text) {
@@ -228,43 +244,147 @@ export class WorkspaceStore {
   }
 
   /** Replay one live DSH session into the dedicated projection workspace. */
-  async projectSession(session, replayFrom = 0, workspaceTitle = 'DSH 任务') {
-    return this.mutate(() => {
-      if (this.state.hiddenSessionIds.includes(session.id)) return null
+  async projectSession(session, replayFrom = 0, workspaceTitle = 'DSH 任务', { returnThread = true } = {}) {
+    return this.mutate(async () => {
+      if (this.state.hiddenSessionIds.includes(session.id)) return { changed: false, value: null }
       const workspace = this.dshWorkspace(sessionCwd(session), workspaceTitle)
-      const thread = this.dshThread(workspace, session)
+      const result = this.dshThread(workspace, session)
+      const { thread } = result
+      let changed = result.changed
       // `snapshotEvents()` replaces the removed `session.events` getter. It is
       // marked deprecated because DSH is moving complete logs out of memory, but
       // rebuilding this canvas from history needs the full sequence and the
       // reader is the only complete-log access a plugin still has.
-      for (const event of session.snapshotEvents()) {
-        if (event.seq >= replayFrom) this.projectEventInto(workspace, thread, event)
+      const events = session.snapshotEvents()
+      if (thread.projectionVersion !== PROJECTION_VERSION) {
+        const repair = this.projectionRepair(workspace, thread, replayFrom)
+        for (const event of events) repair.visit(event)
+        changed = await repair.commit() || changed
+      } else {
+        const seqs = new Set(thread.messages.map(message => message.sourceSeq))
+        for (const event of events) {
+          if (event.seq >= replayFrom && isProjectionEvent(event)) changed = this.projectEventInto(workspace, thread, event, seqs) || changed
+        }
       }
-      return structuredClone(thread)
-    }, { deferred: true })
+      return { changed, value: changed && returnThread ? structuredClone(thread) : null }
+    }, { deferred: true, trackChanges: true })
+  }
+
+  /** Repair closed sessions one at a time, retaining previews rather than logs. */
+  async repairStoredSessions(reader, onError = error => { throw error }) {
+    await this.ready
+    const ids = this.state.workspaces.flatMap(workspace => workspace.threads
+      .filter(thread => typeof thread.dshSessionId === 'string' && thread.projectionVersion !== PROJECTION_VERSION)
+      .map(thread => thread.id))
+    for (const id of ids) {
+      try { await this.mutate(async () => {
+        const located = await this.readThread(id)
+        if (located === null || located.thread.projectionVersion === PROJECTION_VERSION) return { changed: false, value: null }
+        const { workspace, thread } = located
+        // A legacy fork may not have saved its durable cut. Its earliest
+        // indexed seq is a conservative boundary; do not add inherited turns.
+        const legacyCut = thread.parentId || thread.sourceParentSessionId
+          ? thread.messages.reduce((min, message) => Number.isSafeInteger(message.sourceSeq) ? Math.min(min, message.sourceSeq) : min, Infinity)
+          : 0
+        const repair = this.projectionRepair(workspace, thread, thread.sourceSeedLength ?? (Number.isFinite(legacyCut) ? legacyCut : 0))
+        // No commit if the log is absent, corrupt, partial or beyond the limits.
+        const complete = await reader.scan(thread.dshSessionId, repair.visit)
+        const changed = complete === true && await repair.commit()
+        return { changed, value: null }
+      }, { deferred: true, trackChanges: true }) }
+      catch (error) { onError(error) }
+    }
+  }
+
+  /**
+   * Stage a repair off-state. Only exact seq matches may replace/remove old
+   * messages; local notes and rows absent from the available log survive.
+   */
+  projectionRepair(workspace, thread, replayFrom) {
+    const oldBySeq = new Map(thread.messages.filter(message => Number.isSafeInteger(message.sourceSeq)).map(message => [message.sourceSeq, message]))
+    const seen = new Set()
+    const callIds = new Set()
+    const seqs = new Set()
+    const draft = { ...thread, messages: [], pendingProcess: [] }
+    const draftWorkspace = { updatedAt: workspace.updatedAt }
+    const visit = event => {
+      if (!Number.isSafeInteger(event?.seq)) return
+      seen.add(event.seq)
+      if (event.seq < replayFrom || event.type === 'session/title') return
+      if (event.type === 'tool/call' || event.type === 'tool/result') {
+        const id = toolCallId(event)
+        if (id !== '') callIds.add(id)
+      }
+      if (!isProjectionEvent(event)) return
+      const previousLength = draft.messages.length
+      this.projectEventInto(draftWorkspace, draft, event, seqs)
+      if (draft.messages.length > previousLength) {
+        const message = draft.messages.at(-1)
+        const old = oldBySeq.get(message.sourceSeq)
+        if (old) draft.messages[draft.messages.length - 1] = { ...old, ...message, id: old.id }
+      }
+    }
+    const commit = async () => {
+      const projected = new Map(draft.messages.map(message => [message.sourceSeq, message]))
+      // Preserve tool entries whose original events are not in this snapshot.
+      for (const old of thread.messages) {
+        const target = projected.get(old.sourceSeq)
+        if (target && Array.isArray(old.process)) {
+          target.process ??= []
+          target.process.push(...old.process.filter(entry => !callIds.has(String(entry.callId ?? ''))))
+        }
+      }
+      const ordered = draft.messages.map(message => ({ message, order: message.sourceSeq, local: false }))
+      let anchor = -1
+      for (const message of thread.messages) {
+        if (Number.isSafeInteger(message.sourceSeq)) {
+          anchor = message.sourceSeq
+          if (!seen.has(message.sourceSeq)) ordered.push({ message, order: anchor, local: false })
+        } else ordered.push({ message, order: anchor, local: true })
+      }
+      ordered.sort((a, b) => a.order - b.order || Number(a.local) - Number(b.local))
+      const messages = ordered.map(entry => entry.message)
+      const pendingProcess = [...draft.pendingProcess, ...(thread.pendingProcess ?? []).filter(entry => !callIds.has(String(entry.callId ?? '')))]
+      const complete = [...oldBySeq.keys()].every(seq => seen.has(seq))
+      const changed = complete || messages.length !== thread.messages.length
+        || messages.some((message, index) => !sameProjection(message, thread.messages[index]))
+        || !sameProcess(pendingProcess, thread.pendingProcess ?? [])
+      if (!changed) return false
+      // Keep the original canvas, once, before the first provenance repair.
+      try { await copyFile(this.dataFile, `${this.dataFile}.projection-v2-backup`, fsConstants.COPYFILE_EXCL) }
+      catch (error) { if (error.code !== 'EEXIST') throw error }
+      thread.messages = messages
+      thread.pendingProcess = pendingProcess
+      if (complete) thread.projectionVersion = PROJECTION_VERSION
+      thread.updatedAt = new Date().toISOString()
+      workspace.updatedAt = thread.updatedAt
+      return true
+    }
+    return { visit, commit }
   }
 
   /** Project one committed DSH session event. Repeated sequence numbers are ignored. */
   async projectEvent(session, event, workspaceTitle = 'DSH 任务') {
-    return this.mutate(() => {
-      if (this.state.hiddenSessionIds.includes(session.id)) return null
-      const workspace = this.dshWorkspace(sessionCwd(session), workspaceTitle)
-      const thread = this.dshThread(workspace, session)
-      this.projectEventInto(workspace, thread, event)
-      return structuredClone(thread)
-    }, { deferred: true })
+    return this.projectEvents(session, [event], workspaceTitle)
   }
 
-  /** Project a batch of committed events for one session in a single write. */
-  async projectEvents(session, events, workspaceTitle = 'DSH 任务') {
-    if (events.length === 0) return null
+  /** No-op batches return null, without cloning the thread or scheduling a save. */
+  async projectEvents(session, events, workspaceTitle = 'DSH 任务', { returnThread = true } = {}) {
+    const relevant = events.filter(isProjectionEvent)
+    if (relevant.length === 0) return null
     return this.mutate(() => {
-      if (this.state.hiddenSessionIds.includes(session.id)) return null
-      const workspace = this.dshWorkspace(sessionCwd(session), workspaceTitle)
-      const thread = this.dshThread(workspace, session)
-      for (const event of events) this.projectEventInto(workspace, thread, event)
-      return structuredClone(thread)
-    }, { deferred: true })
+      if (this.state.hiddenSessionIds.includes(session.id)) return { changed: false, value: null }
+      let workspace = this.state.workspaces.find(item => item.kind === 'dsh' && item.cwd === sessionCwd(session))
+      const existing = workspace?.threads.find(thread => thread.dshSessionId === session.id)
+      // An empty/injected message must not manufacture a new canvas node.
+      if (existing === undefined && !relevant.some(event => event.type === 'session/title' || event.type === 'tool/call' || event.type === 'tool/result' || projectableEvent(event) !== null)) return { changed: false, value: null }
+      workspace ??= this.dshWorkspace(sessionCwd(session), workspaceTitle)
+      const result = this.dshThread(workspace, session)
+      const { thread } = result
+      let changed = result.changed
+      for (const event of relevant) changed = this.projectEventInto(workspace, thread, event) || changed
+      return { changed, value: changed && returnThread ? structuredClone(thread) : null }
+    }, { deferred: true, trackChanges: true })
   }
 
   async load() {
@@ -295,13 +415,15 @@ export class WorkspaceStore {
     }
   }
 
-  async mutate(action, { deferred = false } = {}) {
+  async mutate(action, { deferred = false, trackChanges = false } = {}) {
     await this.ready
     const task = this.serial.then(async () => {
-      const result = action()
-      if (deferred) this.markDirty()
-      else await this.save()
-      return result
+      const result = await action()
+      if (!trackChanges || result.changed) {
+        if (deferred) this.markDirty()
+        else await this.save()
+      }
+      return trackChanges ? result.value : result
     })
     this.serial = task.catch(() => undefined)
     return task
@@ -426,16 +548,27 @@ export class WorkspaceStore {
   dshThread(workspace, session) {
     let thread = workspace.threads.find(item => item.dshSessionId === session.id)
     if (thread !== undefined) {
+      let changed = false
       if (typeof session.title === 'string' && session.title.trim() !== '') {
         const title = session.title.slice(0, MAX_TITLE_LENGTH)
-        thread.title = title
-        thread.dshSessionTitle = title
+        if (thread.title !== title || thread.dshSessionTitle !== title) {
+          thread.title = title
+          thread.dshSessionTitle = title
+          changed = true
+        }
       }
       // `inheritedEventCount` is DSH's durable fork cut, the successor of the
       // removed `header.seedLength`. It survives restore, unlike `firstLiveSeq`.
       const seedLength = session.inheritedEventCount
-      if (Number.isSafeInteger(seedLength) && seedLength >= 0) thread.sourceSeedLength = seedLength
-      return thread
+      if (Number.isSafeInteger(seedLength) && seedLength >= 0 && thread.sourceSeedLength !== seedLength) {
+        thread.sourceSeedLength = seedLength
+        changed = true
+      }
+      if (changed) {
+        thread.updatedAt = new Date().toISOString()
+        workspace.updatedAt = thread.updatedAt
+      }
+      return { thread, changed }
     }
     const parentSessionId = typeof session.header?.parentSession === 'string' ? session.header.parentSession : null
     const parent = parentSessionId === null ? undefined : workspace.threads.find(item => item.dshSessionId === parentSessionId)
@@ -458,6 +591,7 @@ export class WorkspaceStore {
       updatedAt: now,
       messages: [],
       pendingProcess: [],
+      projectionVersion: PROJECTION_VERSION,
     }
     workspace.threads.push(thread)
     // A child may arrive before its parent during startup replay. Repair that
@@ -466,24 +600,28 @@ export class WorkspaceStore {
       if (child.sourceParentSessionId === session.id && child.parentId === null) child.parentId = thread.id
     }
     workspace.updatedAt = now
-    return thread
+    return { thread, changed: true }
   }
 
-  projectEventInto(workspace, thread, event) {
+  projectEventInto(workspace, thread, event, seqs = null) {
     if (event.type === 'session/title' && typeof event.data?.title === 'string') {
-      thread.title = event.data.title.slice(0, MAX_TITLE_LENGTH)
-      thread.dshSessionTitle = thread.title
+      const title = event.data.title.slice(0, MAX_TITLE_LENGTH)
+      if (thread.title === title && thread.dshSessionTitle === title) return false
+      thread.title = title
+      thread.dshSessionTitle = title
       thread.updatedAt = new Date(event.time).toISOString()
       workspace.updatedAt = thread.updatedAt
-      return
+      return true
     }
     if (event.type === 'tool/call' || event.type === 'tool/result') {
-      this.foldToolProcess(thread, event)
+      if (!this.foldToolProcess(thread, event)) return false
       workspace.updatedAt = thread.updatedAt
-      return
+      return true
     }
+    // Check identity before reading a possibly enormous repeated message body.
+    if (seqs ? seqs.has(event.seq) : thread.messages.some(message => message.sourceSeq === event.seq)) return false
     const projection = projectableEvent(event)
-    if (projection === null || thread.messages.some(message => message.sourceSeq === event.seq)) return
+    if (projection === null) return false
     const at = new Date(event.time).toISOString()
     const message = {
       id: randomUUID(),
@@ -493,18 +631,21 @@ export class WorkspaceStore {
       kind: projection.kind,
       sourceSeq: event.seq,
       at,
+      ...(projection.kind === 'user' && typeof event.data?.source?.kind === 'string' ? { sourceKind: event.data.source.kind } : {}),
       ...(projection.kind === 'assistant' || projection.kind === 'error'
         ? { turn: event.data?.turn, step: event.data?.step, process: [] }
         : {}),
     }
     this.attachPendingProcess(thread, message)
     thread.messages.push(message)
+    seqs?.add(event.seq)
     thread.updatedAt = at
     workspace.updatedAt = at
     if (thread.dshSessionTitle === null && projection.kind === 'user') {
       thread.title = titleFromText(projection.text)
       thread.dshSessionTitle = thread.title
     }
+    return true
   }
 
   /**
@@ -514,14 +655,19 @@ export class WorkspaceStore {
    * assistant/error message, retain it on the thread until that turn appears.
    */
   foldToolProcess(thread, event) {
-    const at = new Date(event.time).toISOString()
     const data = event.data ?? {}
-    const target = [...thread.messages].reverse().find(message =>
-      (message.kind === 'assistant' || message.kind === 'error')
-      && (message.turn === data.turn && message.step === data.step
-        || message.turn === undefined && message.step === undefined))
+    const callId = toolCallId(event)
+    if (callId === '') return false
+    let target
+    for (let index = thread.messages.length - 1; index >= 0; index -= 1) {
+      const message = thread.messages[index]
+      if ((message.kind === 'assistant' || message.kind === 'error')
+          && (message.turn === data.turn && message.step === data.step || message.turn === undefined && message.step === undefined)) {
+        target = message
+        break
+      }
+    }
     const process = target === undefined ? (thread.pendingProcess ??= []) : (target.process ??= [])
-    const callId = String(event.type === 'tool/call' ? data.callId : data.message?.source?.callId ?? '')
     const entry = process.find(item => item.callId === callId)
     // Process records keep only identity and status: tool arguments and results
     // are the bulk of the old file (issue #42) and are reloaded on demand.
@@ -529,6 +675,7 @@ export class WorkspaceStore {
       if (entry === undefined) {
         process.push({ callId, turn: data.turn, step: data.step, name: data.name, status: 'pending' })
       } else {
+        if (entry.name === data.name) return false
         entry.name = data.name
       }
     } else {
@@ -536,11 +683,15 @@ export class WorkspaceStore {
       if (entry === undefined) {
         process.push({ callId, turn: data.turn, step: data.step, name: '工具调用', status: failed ? 'failed' : 'done' })
       } else {
-        entry.status = failed ? 'failed' : 'done'
-        if (typeof entry.name !== 'string' || entry.name === '') entry.name = '工具调用'
+        const status = failed ? 'failed' : 'done'
+        const name = typeof entry.name === 'string' && entry.name !== '' ? entry.name : '工具调用'
+        if (entry.status === status && entry.name === name) return false
+        entry.status = status
+        entry.name = name
       }
     }
-    thread.updatedAt = at
+    thread.updatedAt = new Date(event.time).toISOString()
+    return true
   }
 
   attachPendingProcess(thread, message) {
@@ -585,7 +736,7 @@ function normalizeState(value) {
       ...workspace,
       threads: Array.isArray(workspace.threads) ? workspace.threads.map(thread => {
         if (Array.isArray(thread.messages)) {
-          const messages = thread.messages.filter(message => !isInjectedUserMessage(message))
+          const messages = thread.messages.filter(message => !(message.kind === 'user' && isInjectedUserSource(message.source ?? { kind: message.sourceKind })))
           if (messages.length !== thread.messages.length) migrated = true
           return { ...thread, messages }
         }
@@ -733,6 +884,19 @@ function requiredText(value, maxLength, field) {
   return text
 }
 
+function toolCallId(event) {
+  const id = event.type === 'tool/call' ? event.data?.callId : event.data?.message?.source?.callId
+  return id === null || id === undefined ? '' : String(id)
+}
+
+/** Cheap intake filter; error kinds stay aligned with the body projection. */
+function isProjectionEvent(event) {
+  if (event?.type === 'session/title') return typeof event.data?.title === 'string'
+  if (event?.type === 'tool/call' || event?.type === 'tool/result') return toolCallId(event) !== ''
+  if (event?.type === 'user/message' && isInjectedUserSource(event.data?.source)) return false
+  return eventKind(event) !== null
+}
+
 /** Event → canvas message kind, or null when the event is not a message. */
 function eventKind(event) {
   switch (event?.type) {
@@ -774,140 +938,9 @@ function projectableEvent(event) {
   const kind = eventKind(event)
   if (kind === null) return null
   const text = eventBody(event)
-  if (kind === 'user' && (isInjectedUserSource(event.data?.source) || isRuntimeContextText(text))) return null
+  if (kind === 'user' && (isInjectedUserSource(event.data?.source)
+    || typeof event.data?.source?.kind !== 'string' && isRuntimeContextText(text))) return null
   return noteProjection(kind, text)
-}
-
-/**
- * Full bodies for the requested stored messages, assembled from one session's
- * event log. Exported so the on-demand loader is testable without a Host.
- * `seqs === null` returns every projected message of the thread.
- */
-export function bodiesFromEvents(thread, events, seqs) {
-  const wanted = seqs === null ? null : new Set(seqs)
-  const messages = {}
-  const eventsBySeq = new Map(events.map(event => [event?.seq, event]))
-  const calls = new Map()
-  for (const event of events) {
-    if (event?.type !== 'tool/call' && event?.type !== 'tool/result') continue
-    const callId = String(event.type === 'tool/call' ? event.data?.callId : event.data?.message?.source?.callId ?? '')
-    if (callId === '') continue
-    const record = calls.get(callId) ?? {}
-    if (event.type === 'tool/call') {
-      record.arguments = typeof event.data?.arguments === 'string' ? event.data.arguments : null
-    } else {
-      record.result = contentText(event.data?.message?.content) || null
-      record.error = errorText(event.data?.error)
-    }
-    calls.set(callId, record)
-  }
-  for (const message of thread.messages ?? []) {
-    if (wanted !== null && !wanted.has(message.sourceSeq)) continue
-    const event = eventsBySeq.get(message.sourceSeq)
-    if (event === undefined) continue
-    const body = eventBody(event).trim()
-    const capped = body.length > MAX_BODY_CHARS ? `${body.slice(0, MAX_BODY_CHARS)}${BODY_TRUNCATED_SUFFIX}` : body
-    const process = Array.isArray(message.process)
-      ? message.process.map(entry => ({ ...entry, ...(calls.get(String(entry.callId)) ?? {}) }))
-      : []
-    messages[String(message.sourceSeq)] = { text: capped, truncated: capped.length < body.length, process }
-  }
-  return messages
-}
-
-// ---------------------------------------------------------------------------
-// Session logs on disk
-//
-// `ctx.sessions` only exposes sessions this process currently holds, which is
-// one or two out of a workspace's history. Everything else is read from the DSH
-// session log: a run of concatenated zstd frames holding JSONL events.
-// ---------------------------------------------------------------------------
-
-const SESSION_LOG_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
-const SESSION_LOG_PATTERN = /^session(?:\.[\w-]+)*\.jsonl\.zstd$/
-
-/** Decode the concatenated zstd frames of one session log into JSONL text. */
-export function decodeSessionLog(buffer) {
-  if (typeof zstdDecompressSync !== 'function') return null
-  const offsets = []
-  let index = buffer.indexOf(SESSION_LOG_MAGIC, 0)
-  while (index !== -1) {
-    offsets.push(index)
-    index = buffer.indexOf(SESSION_LOG_MAGIC, index + 4)
-  }
-  if (offsets.length === 0) return null
-  const parts = []
-  for (let i = 0; i < offsets.length; i += 1) {
-    const end = i + 1 < offsets.length ? offsets[i + 1] : buffer.length
-    try {
-      parts.push(zstdDecompressSync(buffer.subarray(offsets[i], end)))
-    } catch {
-      // A log that is being appended to can end mid-frame; decode what is whole.
-      break
-    }
-  }
-  if (parts.length === 0) return null
-  return Buffer.concat(parts).toString('utf8')
-}
-
-/** Reads session events from `$DSH_HOME/sessions`, caching by file mtime. */
-export class SessionLogReader {
-  constructor(directory) {
-    this.directory = directory
-    this.cache = new Map()
-  }
-
-  /** Events of one session, or null when its log is missing or unreadable. */
-  async events(sessionId) {
-    if (typeof this.directory !== 'string' || this.directory === '' || typeof sessionId !== 'string' || sessionId === '') return null
-    const file = await this.findLog(sessionId)
-    if (file === null) {
-      this.cache.delete(sessionId)
-      return null
-    }
-    const info = await stat(file).catch(() => null)
-    if (info === null) return null
-    const cached = this.cache.get(sessionId)
-    if (cached !== undefined && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached.events
-    const text = decodeSessionLog(await readFile(file))
-    if (text === null) return null
-    const events = []
-    for (const line of text.split('\n')) {
-      if (line.trim() === '') continue
-      try {
-        const event = JSON.parse(line)
-        if (typeof event?.seq === 'number') events.push(event)
-      } catch {
-        // Trailing partial line while the session is still being written.
-      }
-    }
-    // Keep a few decoded logs; one screenful of cards touches few threads.
-    if (this.cache.size >= 4) this.cache.delete(this.cache.keys().next().value)
-    this.cache.set(sessionId, { mtimeMs: info.mtimeMs, size: info.size, events })
-    return events
-  }
-
-  async findLog(sessionId) {
-    let workspaces
-    try {
-      workspaces = await readdir(this.directory, { withFileTypes: true })
-    } catch {
-      return null
-    }
-    for (const workspace of workspaces) {
-      if (!workspace.isDirectory()) continue
-      const sessionDirectory = join(this.directory, workspace.name, sessionId)
-      let files
-      try {
-        files = await readdir(sessionDirectory)
-      } catch {
-        continue
-      }
-      const log = files.find(name => SESSION_LOG_PATTERN.test(name))
-      if (log !== undefined) return join(sessionDirectory, log)
-    }
-    return null
-  }
 }
 
 function errorText(value) {
@@ -922,56 +955,43 @@ function errorText(value) {
 
 function noteProjection(kind, text) {
   const normalized = text.trim()
-  if (normalized === '') return null
+  // Empty assistant steps still own tools; they never create a user turn.
+  if (normalized === '' && kind !== 'assistant') return null
   const excerpt = excerptOf(normalized)
   return { kind, text: excerpt, length: normalized.length, truncated: excerpt.length < normalized.length }
 }
 
 /** Short preview kept in the workspace file, with an ellipsis when cut. */
 function excerptOf(text) {
-  if (text.length <= EXCERPT_CHARS) return text
-  return `${text.slice(0, EXCERPT_CHARS).trimEnd()}…`
+  const excerpt = text.length <= EXCERPT_CHARS ? text : `${text.slice(0, EXCERPT_CHARS).trimEnd()}…`
+  return Buffer.from(excerpt, 'utf8').toString('utf8')
 }
 
 function isRuntimeContextText(text) {
   return typeof text === 'string' && text.trimStart().startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')
 }
 
-function isRuntimeContextMessage(message) {
-  return message?.kind === 'user' && isRuntimeContextText(message.text)
-}
-
 /** A harness-authored turn, identified by its structured provenance. */
 function isInjectedUserSource(source) {
-  return typeof source?.kind === 'string' && INJECTED_USER_SOURCE_KINDS.has(source.kind)
-}
-
-/**
- * Recognises a stored skill catalogue. Only the harness emits both markers
- * together, so a person quoting one of them is still kept as a real turn.
- */
-function isSkillCatalogText(text) {
-  if (typeof text !== 'string') return false
-  const head = text.trimStart()
-  return head.startsWith(SKILL_CATALOG_OPENER) && head.includes(SKILL_CATALOG_MARKER)
-}
-
-/**
- * Whether a stored message must stay out of the canvas graph: runtime
- * snapshots and skill catalogues were never a turn the user took.
- */
-function isInjectedUserMessage(message) {
-  return message?.kind === 'user' && (isRuntimeContextMessage(message) || isSkillCatalogText(message.text))
+  return typeof source?.kind === 'string' && source.kind !== 'user'
 }
 
 function contentText(content) {
   if (!Array.isArray(content)) return ''
-  return content.flatMap(block => {
-    if (block?.type === 'text') return [block.text]
-    if (block?.type === 'tool-call') return [block.name, block.arguments]
-    if (block?.type === 'tool-result') return contentText(block.content)
-    return []
-  }).filter(value => typeof value === 'string' && value.trim() !== '').join('\n')
+  return content.filter(block => block?.type === 'text').map(block => block.text)
+    .filter(value => typeof value === 'string' && value.trim() !== '').join('\n')
+}
+
+function sameProcess(a, b) {
+  return a.length === b.length && a.every((entry, index) => {
+    const other = b[index]
+    return other && ['callId', 'name', 'status', 'turn', 'step'].every(key => entry[key] === other[key])
+  })
+}
+
+function sameProjection(a, b) {
+  return b && ['id', 'text', 'length', 'truncated', 'kind', 'sourceSeq', 'sourceKind', 'at', 'turn', 'step'].every(key => a[key] === b[key])
+    && sameProcess(a.process ?? [], b.process ?? [])
 }
 
 function titleFromText(text) {
@@ -1014,7 +1034,7 @@ function sendFile(res, contentType, body) {
 }
 
 function page() {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Synapse for DSH</title><link rel="stylesheet" href="/synapse/styles.css"></head><body><div id="app"></div><script src="/synapse/app.js"></script></body></html>`
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><base href="./"><title>Synapse for DSH</title><link rel="stylesheet" href="styles.css"></head><body><div id="app"></div><script src="browser-cache.js"></script><script src="app.js"></script></body></html>`
 }
 
 /** Mount Synapse routes on the existing DSH Web Server. */
@@ -1038,13 +1058,14 @@ export function apply(ctx, config) {
     // history through the parent node, so only project the child's live tail:
     // `inheritedEventCount` is 0 without a fork and the durable cut with one.
     const replayFrom = session.inheritedEventCount ?? 0
-    void store.projectSession(session, replayFrom, projectionWorkspaceTitle).catch(reportProjectionFailure)
+    void store.projectSession(session, replayFrom, projectionWorkspaceTitle, { returnThread: false }).catch(reportProjectionFailure)
   }
   // Buffer live events per session and flush them in one write per microtask,
   // so a burst of turn events coalesces into a single save instead of N.
   const projectionQueue = []
   let projectionScheduled = false
   const enqueueProjection = (session, event) => {
+    if (!isProjectionEvent(event)) return
     projectionQueue.push({ session, event })
     if (projectionScheduled) return
     projectionScheduled = true
@@ -1057,8 +1078,8 @@ export function apply(ctx, config) {
         if (entry === undefined) bySession.set(item.session.id, [item.session, [item.event]])
         else entry[1].push(item.event)
       }
-      for (const [sessionId, [session, events]] of bySession) {
-        void store.projectEvents(session, events, projectionWorkspaceTitle).catch(reportProjectionFailure)
+      for (const [session, events] of bySession.values()) {
+        void store.projectEvents(session, events, projectionWorkspaceTitle, { returnThread: false }).catch(reportProjectionFailure)
       }
     })
   }
@@ -1066,30 +1087,39 @@ export function apply(ctx, config) {
     ctx.on('session/created', replaySession)
     ctx.on('session/event', enqueueProjection)
     for (const session of ctx.sessions.list()) replaySession(session)
+    void store.repairStoredSessions(sessionLog, reportProjectionFailure).catch(reportProjectionFailure)
   }
-  // Bodies live in the session log, not in the workspace file (issue #42). The
-  // canvas pulls them for the cards it actually renders; the detail view pulls a
-  // whole thread at once. An archived or already-removed session cannot be
-  // re-read, so the caller is told instead of receiving silently empty text.
-  const threadBodies = async (threadId, seqs) => {
-    const located = await store.locateThread(threadId)
+  // Both the canvas and detail view select a bounded page. Closed sessions
+  // retain only that page's messages and tools, never the whole decoded log.
+  const threadBodies = async (threadId, { seqs, cursor, limit }) => {
+    const located = await store.readThread(threadId)
     if (located === null) throw new NotFoundError('会话不存在')
     const { thread } = located
     const wanted = seqs === null ? null : new Set(seqs)
+    const candidates = (thread.messages ?? []).filter(message => Number.isSafeInteger(message.sourceSeq) && (wanted === null || wanted.has(message.sourceSeq)))
+    const selected = candidates.slice(cursor, cursor + limit)
+    let payloads = {}
+    let unavailable = false
+    let warning
     if (thread.dshSessionId === null) {
-      const messages = {}
-      for (const message of thread.messages ?? []) {
-        if (wanted !== null && !wanted.has(message.sourceSeq)) continue
-        messages[String(message.sourceSeq)] = { text: message.text, truncated: message.truncated === true, process: message.process ?? [], local: true }
+      for (const message of selected) payloads[String(message.sourceSeq)] = { ...previewBody(message, 'local'), previewOnly: false, local: true }
+    } else if (selected.length > 0) {
+      const session = ctx.sessions.list().find(candidate => candidate.id === thread.dshSessionId)
+      let events
+      try {
+        events = session !== undefined ? session.snapshotEvents() : await sessionLog.events(thread.dshSessionId, bodySelection(selected))
+      } catch (error) {
+        if (!(error instanceof LogLimitError)) throw error
+        warning = error.message
+        for (const message of selected) payloads[String(message.sourceSeq)] = previewBody(message, 'limit')
       }
-      return { messages }
+      if (events) payloads = bodiesFromEvents({ messages: selected }, events, null)
+      else if (!warning) {
+        unavailable = true
+        for (const message of selected) payloads[String(message.sourceSeq)] = previewBody(message, 'unavailable')
+      }
     }
-    const session = ctx.sessions.list().find(candidate => candidate.id === thread.dshSessionId)
-    if (session !== undefined) return { messages: bodiesFromEvents(thread, session.snapshotEvents(), seqs) }
-    // Closed session: read its log from disk, which is where the body lives.
-    const events = await sessionLog.events(thread.dshSessionId)
-    if (events === null) return { messages: {}, unavailable: true }
-    return { messages: bodiesFromEvents(thread, events, seqs) }
+    return { ...bodyPage(selected, payloads, cursor, candidates.length), ...(unavailable ? { unavailable: true } : {}), ...(warning ? { warning } : {}) }
   }
   // The DSH /api browser-trust fence does not cover /synapse routes, so this
   // handler checks the Host header itself: localhost is allowed by default and
@@ -1106,6 +1136,7 @@ export function apply(ctx, config) {
         if (req.method === 'GET') return sendJson(res, 200, { workspaces: await store.list() })
         if (req.method === 'POST') return sendJson(res, 201, { workspace: await store.create((await readJson(req)).title) })
       }
+      if (path === '/synapse/api/threads/query' && req.method === 'POST') return sendJson(res, 200, { threads: await store.threadsForSessions((await readJson(req))?.sessionIds) })
       const workspace = /^\/synapse\/api\/workspaces\/([0-9a-f-]+)$/i.exec(path)
       if (workspace !== null) {
         if (req.method === 'GET') return sendJson(res, 200, { workspace: await store.get(workspace[1]) })
@@ -1118,11 +1149,25 @@ export function apply(ctx, config) {
       if (messages !== null && req.method === 'POST') return sendJson(res, 201, { thread: await store.addMessage(messages[1], (await readJson(req)).text) })
       const full = /^\/synapse\/api\/threads\/([0-9a-f-]+)\/full$/i.exec(path)
       if (full !== null && req.method === 'GET') {
-        const raw = new URL(req.url ?? '/', 'http://dsh.local').searchParams.get('seqs')
-        const seqs = raw === null || raw.trim() === ''
-          ? null
-          : raw.split(',').map(value => Number.parseInt(value, 10)).filter(value => Number.isInteger(value) && value >= 0)
-        return sendJson(res, 200, await threadBodies(full[1], seqs))
+        const params = new URL(req.url ?? '/', 'http://dsh.local').searchParams
+        const integer = (name, fallback, maximum) => {
+          const raw = params.get(name)
+          if (raw === null) return fallback
+          if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) > maximum) throw new InputError(`${name} 超出范围`)
+          return Number(raw)
+        }
+        const raw = params.get('seqs')
+        let seqs = null
+        if (raw !== null) {
+          if (raw.length > 800) throw new InputError('seqs 过长')
+          const values = raw.split(',')
+          if (values.length > BODY_LIMITS.selectors || values.some(value => !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)))) throw new InputError('seqs 必须是至多 40 个非负整数')
+          seqs = [...new Set(values.map(Number))]
+        }
+        const cursor = integer('cursor', 0, Number.MAX_SAFE_INTEGER)
+        const limit = integer('limit', BODY_LIMITS.pageMessages, BODY_LIMITS.pageMessages)
+        if (limit === 0) throw new InputError('limit 必须大于 0')
+        return sendJson(res, 200, await threadBodies(full[1], { seqs, cursor, limit }))
       }
       const thread = /^\/synapse\/api\/threads\/([0-9a-f-]+)$/i.exec(path)
       if (thread !== null && req.method === 'PATCH') return sendJson(res, 200, { thread: await store.updateThread(thread[1], await readJson(req)) })
@@ -1139,9 +1184,10 @@ export function apply(ctx, config) {
       return sendJson(res, 500, { error: unreadable ? error.message : 'Synapse 数据暂时不可用' })
     }
   }
-  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse', handler: (_req, res) => { res.writeHead(302, { location: '/synapse/' }); res.end() } }), 'synapse: redirect')
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse', handler: (_req, res) => { res.writeHead(302, { location: './synapse/' }); res.end() } }), 'synapse: redirect')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/', handler: (_req, res) => { sendFile(res, 'text/html; charset=utf-8', page()) } }), 'synapse: page')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/app.js', handler: async (_req, res) => { sendFile(res, 'text/javascript; charset=utf-8', await readFile(new URL('./app.js', import.meta.url), 'utf8')) } }), 'synapse: app')
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/browser-cache.js', handler: async (_req, res) => { sendFile(res, 'text/javascript; charset=utf-8', await readFile(new URL('./browser-cache.js', import.meta.url), 'utf8')) } }), 'synapse: browser cache')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/styles.css', handler: async (_req, res) => { sendFile(res, 'text/css; charset=utf-8', await readFile(new URL('./styles.css', import.meta.url), 'utf8')) } }), 'synapse: styles')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/deepseek-mark.svg', handler: async (_req, res) => { sendFile(res, 'image/svg+xml', await readFile(new URL('./deepseek-mark.svg', import.meta.url), 'utf8')) } }), 'synapse: DeepSeek mark')
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/synapse/api', handler: api }), 'synapse: api')

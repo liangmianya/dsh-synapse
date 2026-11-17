@@ -90,6 +90,7 @@ test('mounts its own routes on the existing DSH Web Server', async () => {
     { kind: 'exact', path: '/synapse' },
     { kind: 'exact', path: '/synapse/' },
     { kind: 'exact', path: '/synapse/app.js' },
+    { kind: 'exact', path: '/synapse/browser-cache.js' },
     { kind: 'exact', path: '/synapse/styles.css' },
     { kind: 'exact', path: '/synapse/deepseek-mark.svg' },
     { kind: 'prefix', path: '/synapse/api' },

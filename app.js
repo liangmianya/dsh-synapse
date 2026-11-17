@@ -49,23 +49,28 @@ const CARD_HEIGHT = 276
 const CARD_GAP_Y = 42
 const CAMERA_INSET_X = 56
 const CAMERA_INSET_Y = 56
-// Cards outside the viewport (plus this world-space margin) are not mounted
-// into the DOM; the margin pre-mounts cards just before they scroll into view
-// so panning never flashes empty space.
-const VIEWPORT_MARGIN = 1400
+// Fixed world-space margins do not expand to most of the map at 20% zoom.
+const REGION_MARGIN = 360
+const REGION_PREFETCH_MARGIN = 900
+const REGION_TICK_MS = 90
+const MAP_DETAIL_CARDS = 80
+const MAP_OVERVIEW_CARDS = 320
+const MAP_FACE_TEXT = 2400
+const OVERVIEW_ZOOM = .55
+const DETAIL_PAGE_MESSAGES = 40
 const state = {
   summaries: [], workspace: null, activeId: null, selectedCardId: null, mode: 'canvas', zoom: 1, currentDsh: null, sidebarCollapsed: false,
   dshWorkspaces: [], selectedDshWorkspaceId: null,
   historyBySession: new Map(), historyRequests: new Map(), pendingReplies: new Map(), pendingRpc: new Map(), liveReplies: new Map(),
   // Message bodies are not part of the workspace payload; they are fetched per
   // screenful and cached here (issue #42).
-  bodies: new Map(), bodyRequests: new Set(), bodyFailures: new Set(), bodiesLoaded: new Set(),
+  bodyFailures: new Set(), mapVisible: window.parent === window,
   archivedSessionIds: new Set(),
-  draft: null, error: '', workspaceLoad: 0, workspaceLoadOwner: null, workspaceLoadBusy: false, workspaceFingerprint: null, workspacesSignature: null, branchAnchors: new Map(savedBranchAnchors), cardPositions: new Map(savedCardPositions), collapsedCardIds: new Set(savedCollapsedCards), quickPhrases: savedQuickPhrases, quickPhraseEditorOpen: false,
+  draft: null, error: '', workspaceLoad: 0, workspaceLoadOwner: null, workspaceLoadBusy: false, workspaceFingerprint: null, workspaceSummariesSignature: null, workspaceDshSignature: null, workspacesSignature: null, branchAnchors: new Map(savedBranchAnchors), cardPositions: new Map(savedCardPositions), collapsedCardIds: new Set(savedCollapsedCards), quickPhrases: savedQuickPhrases, quickPhraseEditorOpen: false,
   dragging: false, canvasGesture: false, canvasRefreshAfter: 0, canvasViewInitialized: false, canvasCamera: { x: 0, y: 0 }, mapCardSessionSwitches: new Set(),
   expandedMessageIds: new Set(),
   canvasCards: undefined, canvasCardsById: undefined, canvasGraph: undefined, mountedCardIds: new Set(), canvasNeedsCenter: false,
-  detailScrollByThread: new Map(), detailThreadId: null, detailTargetCardId: null,
+  detailScrollByThread: new Map(), detailThreadId: null, detailTargetCardId: null, detailPageByThread: new Map(),
   inspectorCardId: null, inspectorOpening: false, inspectorScrollByCard: new Map(),
 }
 
@@ -74,7 +79,309 @@ const formatTime = value => new Date(value).toLocaleString('zh-CN', { month: 'nu
 const currentThread = () => state.workspace?.threads.find(thread => thread.id === state.activeId) ?? state.workspace?.threads[0] ?? null
 const threadListTitle = thread => thread.dshSessionTitle ?? thread.title ?? questionFor(thread)
 
+const bodyCache = new SynapseCache.BodyCache()
+const bodyLoader = new SynapseCache.BodyLoader({
+  cache: bodyCache,
+  request: (path, signal) => api(path, { signal }),
+  onUpdate: entries => {
+    // #region debug-point body-update
+    if (inspectorDebug.enabled) inspectorDebug.log('D', 'bodyLoader:onUpdate', 'body-update', { jobs: bodyLoader.jobs.size, failures: bodyLoader.failures.size })
+    // #endregion debug-point body-update
+    if (!state.mapVisible || document.hidden) return
+    if (state.mode === 'thread') render()
+    else refreshLoadedBodies(entries)
+  },
+})
+state.bodyFailures = bodyLoader.failures
+let cacheWorkspaceId = null
+let cacheThreadIds = new Set()
+
+// #region debug-point inspector-panel
+// Temporary, opt-in runtime evidence. Keep the panel outside #app so a map
+// reconciliation cannot destroy it. Never capture chat text or tool payloads.
+const inspectorDebug = (() => {
+  const endpoint = 'http://127.0.0.1:7777/event'
+  const pageId = crypto.randomUUID()
+  const events = []
+  const queue = []
+  const labels = {
+    'record-start': '开始记录', 'record-stop': '停止记录', 'user-flash': '已标记：侧栏闪退',
+    'card-click': '点击卡片', 'inspector-open': '设置侧栏选择', 'inspector-close': '主动关闭侧栏',
+      'close-timer': '关闭动画计时完成', 'session-sync': '收到宿主会话同步',
+      'session-status-only': '同一会话状态更新，保留卡片选择',
+    'session-clears': '会话同步清空侧栏', 'host-activate': '请求宿主切换会话',
+    'graph-check': '检查卡片是否还在图中', 'graph-clears': '图中缺少卡片，清空侧栏',
+    'prune': '工作区缓存检查', 'prune-clears': '工作区切换清空侧栏',
+    'workspace-input': '手动切换工作区', 'new-session': '新建会话', 'archive': '归档会话',
+    'button-click': '地图按钮操作', 'body-start': '开始请求正文', 'body-result': '正文请求完成',
+    'body-error': '正文请求未完成', 'body-update': '正文缓存更新', 'body-wanted': '登记需要加载的正文',
+    'body-paused': '暂停正文加载', 'render-before': '准备重绘', 'render-after': '重绘完成',
+    'dom-change': '侧栏 DOM 状态变化', 'release-dom': '释放隐藏地图的侧栏',
+    'map-visibility': '宿主改变地图可见性', 'page-visibility': '页面可见性变化',
+  }
+  let recording = false
+  let connected = true
+  let transport = '点击开始后连接采集器'
+  let sequence = 0
+  let delivered = 0
+  let dropped = 0
+  let pending = 0
+  let runNumber = 0
+  let runId = 'pre-fix'
+  let uiTimer = 0
+  let retryTimer = 0
+  let lastDomSignature = null
+  const panel = document.createElement('aside')
+  panel.className = 'inspector-debug'
+  panel.setAttribute('aria-label', '侧栏调试')
+  panel.innerHTML = `<button type="button" class="inspector-debug-toggle">侧栏调试</button>
+    <section class="inspector-debug-panel" hidden>
+      <header><strong>侧栏闪退调试</strong><button type="button" data-debug="fold">收起</button></header>
+      <p>点击开始后持续记录，手动点停止才结束。“标记闪退”只加标记。</p>
+      <div class="inspector-debug-actions">
+        <select aria-label="记录阶段"><option value="pre-fix">修复前</option><option value="post-fix">修复后</option></select>
+        <button type="button" data-debug="start">开始新记录</button>
+        <button type="button" data-debug="stop" disabled>停止</button>
+        <button type="button" data-debug="mark" disabled>标记闪退</button>
+        <button type="button" data-debug="export">导出日志</button>
+        <button type="button" data-debug="clear">清空面板</button>
+      </div>
+      <div class="inspector-debug-status" role="status"></div>
+      <pre class="inspector-debug-state"></pre>
+      <ol class="inspector-debug-events"></ol>
+      <small>仅记录卡片编号、加载和侧栏状态；面板最多保留 400 条。</small>
+    </section>`
+  document.body.append(panel)
+  const section = panel.querySelector('section')
+  const status = panel.querySelector('.inspector-debug-status')
+  const stateView = panel.querySelector('.inspector-debug-state')
+  const eventView = panel.querySelector('.inspector-debug-events')
+  const phase = panel.querySelector('select')
+  const snapshot = () => {
+    const inspector = app.querySelector('.card-inspector')
+    return {
+      workspaceId: state.workspace?.id ?? null, activeId: state.activeId,
+      selectedCardId: state.selectedCardId, inspectorCardId: state.inspectorCardId,
+      inspectorDom: inspector !== null, opening: inspector?.classList.contains('is-opening') ?? false,
+      closing: inspector?.classList.contains('is-closing') ?? false,
+      mapVisible: state.mapVisible, hidden: document.hidden, mode: state.mode,
+      graphCount: state.canvasCards?.length ?? 0, mountedCount: state.mountedCardIds.size,
+      workspaceBusy: state.workspaceLoadBusy,
+    }
+  }
+  const paint = () => {
+    uiTimer = 0
+    const view = snapshot()
+    panel.querySelector('.inspector-debug-toggle').textContent = recording ? `调试记录中 · ${events.length}` : '侧栏调试'
+    status.textContent = `${recording ? '记录中' : '已停止'} · ${transport} · 已送达 ${delivered} · 待发送 ${queue.length + pending} · 超限 ${dropped}`
+    status.dataset.failed = String(!connected)
+    stateView.textContent = `选中卡片：${view.inspectorCardId ?? '无'}\n侧栏元素：${view.inspectorDom ? '存在' : '不存在'} · 正文缓存：${bodyCache.size} 条 / ${(bodyCache.bytes / 1048576).toFixed(1)} MB\n正文请求：${bodyLoader.jobs.size} · 加载失败：${bodyLoader.failures.size}`
+    eventView.innerHTML = events.slice(-12).reverse().map(event =>
+      `<li><time>${escapeHtml(new Date(event.ts).toLocaleTimeString('zh-CN', { hour12: false }))}</time> ${escapeHtml(labels[event.msg.slice(8)] ?? event.msg)}<span>${escapeHtml(event.data.inspectorCardId ?? '无侧栏选择')}</span></li>`).join('')
+    panel.querySelector('[data-debug="stop"]').disabled = !recording
+    panel.querySelector('[data-debug="mark"]').disabled = !recording
+    panel.querySelector('[data-debug="start"]').disabled = recording || pending !== 0 || queue.length !== 0
+    phase.disabled = recording
+  }
+  const schedulePaint = () => { if (uiTimer === 0) uiTimer = window.setTimeout(paint, 150) }
+  const pump = () => {
+    if (retryTimer !== 0) return
+    while (pending < 2 && queue.length > 0) {
+      const event = queue.shift()
+      pending++
+      const controller = new AbortController()
+      const timer = window.setTimeout(() => controller.abort(), 2000)
+      fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event), signal: controller.signal })
+        .then(response => {
+          if (!response.ok) throw new Error('collector-http')
+          delivered++
+          connected = true
+          transport = '采集器已连接'
+        })
+        .catch(() => {
+          connected = false
+          if (queue.length < 100) queue.unshift(event)
+          else dropped++
+          transport = '连接异常，仍在本页记录；稍后自动重连，可导出日志'
+          if (retryTimer === 0) retryTimer = window.setTimeout(() => { retryTimer = 0; pump() }, 5000)
+        })
+        .finally(() => { window.clearTimeout(timer); pending--; schedulePaint(); pump() })
+    }
+  }
+  const log = (hypothesisId, location, name, data = {}) => {
+    if (!recording) return
+    const event = {
+      sessionId: 'early-card-flash', runId, hypothesisId, location, msg: `[DEBUG] ${name}`,
+      ts: Date.now(), data: { ...snapshot(), ...data, pageId, runNumber, eventSeq: ++sequence },
+    }
+    if (events.length === 400) events.shift()
+    events.push(event)
+    if (queue.length < 100) queue.push(event)
+    else dropped++
+    schedulePaint()
+    pump()
+  }
+  const observer = new MutationObserver(() => {
+    if (!recording) return
+    const view = snapshot()
+    const signature = JSON.stringify([view.inspectorCardId, view.inspectorDom, view.opening, view.closing, view.mapVisible, view.hidden, view.mode])
+    if (signature === lastDomSignature) return
+    lastDomSignature = signature
+    log('D', 'debug:MutationObserver', 'dom-change')
+  })
+  panel.addEventListener('click', event => {
+    const button = event.target.closest('button')
+    if (button === null) return
+    if (button.classList.contains('inspector-debug-toggle')) { section.hidden = !section.hidden; paint() }
+    if (button.dataset.debug === 'fold') section.hidden = true
+    if (button.dataset.debug === 'start' && !recording && pending === 0) {
+      events.length = 0
+      queue.length = 0
+      sequence = 0
+      delivered = 0
+      dropped = 0
+      connected = true
+      runNumber++
+      runId = phase.value
+      recording = true
+      transport = '正在连接采集器'
+      lastDomSignature = null
+      observer.observe(app, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] })
+      log('A-D', 'debug:panel', 'record-start', { cacheEntries: bodyCache.size, cacheBytes: bodyCache.bytes })
+      paint()
+    }
+    if (button.dataset.debug === 'stop') {
+      log('A-D', 'debug:panel', 'record-stop')
+      recording = false
+      observer.disconnect()
+      paint()
+    }
+    if (button.dataset.debug === 'mark') { log('A-D', 'debug:panel', 'user-flash'); paint() }
+    if (button.dataset.debug === 'clear') {
+      events.length = 0
+      paint()
+    }
+    if (button.dataset.debug === 'export') {
+      const blob = new Blob(events.map(event => `${JSON.stringify(event)}\n`), { type: 'application/x-ndjson' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `synapse-early-card-flash-${runId}-${Date.now()}.ndjson`
+      link.click()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    }
+  })
+  paint()
+  return { get enabled() { return recording }, log, snapshot }
+})()
+// #endregion debug-point inspector-panel
+
+function bodyRevision(message) {
+  // Source messages are immutable; tools may finish or be added afterward.
+  // Use only projection metadata, never hydrated arguments/results.
+  return message.bodyRevision ?? JSON.stringify([
+    message.text, message.length, message.kind, message.at,
+    (message.process ?? []).slice(0, 12).map(entry => [entry.callId, entry.name, entry.status]),
+    message.process?.length ?? 0,
+  ])
+}
+
+function hydratedMessage(thread, message) {
+  if (message === null || message === undefined) return message
+  const revision = bodyRevision(message)
+  const body = bodyCache.get(thread.id, message.sourceSeq, revision)
+  return body === undefined ? message : { ...message, ...body, bodyRevision: revision, hydrated: true }
+}
+
+function hydratedCard(card) {
+  const thread = canvasGraphCache?.threadById.get(card.dshThreadId) ?? state.workspace?.threads.find(item => item.id === card.dshThreadId)
+  if (thread === undefined) return card
+  const question = hydratedMessage(thread, card.questionMessage)
+  return { ...card, question: question?.text ?? card.question, questionMessage: question,
+    answer: hydratedMessage(thread, card.answer), error: hydratedMessage(thread, card.error) }
+}
+
+function clearViewCaches() {
+  cancelRegionWork()
+  invalidateCanvasGraph()
+  bodyLoader.pause({ clearCache: true })
+  markdownCache.clear()
+  state.canvasCards = undefined
+  state.canvasCardsById = undefined
+  state.canvasGraph = undefined
+  canvasGraphCache = null
+  regionView = null
+  regionElements.clear()
+  state.mountedCardIds.clear()
+  connectorPathsByCard.clear()
+}
+
+function prepareWorkspaceCaches(id) {
+  if (state.workspace?.id === id) return
+  // #region debug-point workspace-caches
+  if (inspectorDebug.enabled) inspectorDebug.log('C', 'prepareWorkspaceCaches', 'prune', { nextWorkspaceId: id, operation: 'prepare' })
+  // #endregion debug-point workspace-caches
+  clearViewCaches()
+}
+
+function pruneWorkspaceCaches() {
+  invalidateCanvasGraph()
+  const threads = visibleThreads(state.workspace?.threads ?? [])
+  const ids = new Set(threads.map(thread => thread.id))
+  const sessions = new Set(threads.map(thread => thread.dshSessionId))
+  const switched = cacheWorkspaceId !== (state.workspace?.id ?? null)
+  const removed = switched || [...cacheThreadIds].some(id => !ids.has(id))
+  // #region debug-point workspace-caches
+  if (inspectorDebug.enabled) inspectorDebug.log('C', 'pruneWorkspaceCaches', 'prune', { cachedWorkspaceId: cacheWorkspaceId, switched, removed, threadCount: ids.size })
+  // #endregion debug-point workspace-caches
+  const belongs = key => ids.has(key.slice(0, key.indexOf(':')))
+  if (switched) clearViewCaches()
+  else bodyLoader.retainThreads(ids)
+  if (removed) {
+    markdownCache.clear()
+    for (const key of state.expandedMessageIds) if (switched || !belongs(key)) state.expandedMessageIds.delete(key)
+    for (const map of [state.detailScrollByThread, state.detailPageByThread]) {
+      for (const key of map.keys()) if (switched || !ids.has(key)) map.delete(key)
+    }
+    for (const key of state.inspectorScrollByCard.keys()) if (switched || !belongs(key)) state.inspectorScrollByCard.delete(key)
+    state.canvasCards = undefined
+    state.canvasCardsById = undefined
+    state.canvasGraph = undefined
+    state.mountedCardIds.clear()
+    connectorPathsByCard.clear()
+    if (switched) {
+      // #region debug-point workspace-caches
+      if (inspectorDebug.enabled) inspectorDebug.log('C', 'pruneWorkspaceCaches:reset', 'prune-clears', { cachedWorkspaceId: cacheWorkspaceId })
+      // #endregion debug-point workspace-caches
+      state.inspectorCardId = null; state.inspectorOpening = false; state.detailThreadId = null
+    }
+  }
+  for (const map of [state.historyBySession, state.liveReplies]) for (const id of map.keys()) if (!sessions.has(id)) map.delete(id)
+  cacheWorkspaceId = state.workspace?.id ?? null
+  cacheThreadIds = ids
+}
+
+function pauseMapBodies() {
+  state.mapVisible = false
+  clearViewCaches()
+  state.liveReplies.clear()
+  hideSelectionFollowup()
+  releaseRenderedBodies()
+}
+
+function releaseRenderedBodies() {
+  // #region debug-point visibility
+  if (inspectorDebug.enabled) inspectorDebug.log('D', 'releaseRenderedBodies', 'release-dom')
+  // #endregion debug-point visibility
+  // An iframe hidden by the host still retains its DOM. Drop the content,
+  // keeping the viewport shell so camera measurements work on reopening.
+  document.querySelector('.canvas-viewport')?.replaceChildren()
+  document.querySelector('.detail-scroll')?.replaceChildren()
+  document.querySelector('.card-inspector')?.remove()
+}
+
 function rememberBranchAnchor(sessionId, cardId) {
+  invalidateCanvasGraph()
   state.branchAnchors.set(sessionId, cardId)
   try { localStorage.setItem('dsh-synapse:branch-anchors', JSON.stringify([...state.branchAnchors])) } catch { /* Private browsing may disable local storage. */ }
 }
@@ -84,6 +391,7 @@ function persistCardPositions() {
 }
 
 function persistCollapsedCards() {
+  invalidateCanvasGraph()
   try { localStorage.setItem(COLLAPSED_CARDS_KEY, JSON.stringify([...state.collapsedCardIds])) } catch { /* Private browsing may disable local storage. */ }
 }
 
@@ -98,6 +406,7 @@ function rememberCardPosition(cardId, position, aliases = []) {
 }
 
 function resetCardPositions() {
+  invalidateCanvasGraph()
   state.cardPositions.clear()
   persistCardPositions()
   try {
@@ -112,13 +421,35 @@ function resetCanvasCamera() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { ...options, headers: { 'content-type': 'application/json', ...(options.headers ?? {}) } })
+  // Call sites use the server's logical /synapse namespace. Resolve requests
+  // inside this map document so a prefix-stripping proxy keeps its public path.
+  const url = new URL(path.replace(/^\/synapse\//, ''), document.baseURI)
+  // #region debug-point body-request
+  const traceBody = inspectorDebug.enabled && path.includes('/full?')
+  const traceStarted = traceBody ? performance.now() : 0
+  if (traceBody) inspectorDebug.log('D', 'api:request', 'body-start', { path })
+  // #endregion debug-point body-request
+  const response = await fetch(url, { ...options, headers: { 'content-type': 'application/json', ...(options.headers ?? {}) } }).catch(error => {
+    // #region debug-point body-request
+    if (traceBody) inspectorDebug.log('D', 'api:rejected', 'body-error', { path, aborted: options.signal?.aborted ?? false, errorName: error.name, elapsedMs: Math.round(performance.now() - traceStarted) })
+    // #endregion debug-point body-request
+    throw error
+  })
   const body = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(body.error ?? '请求失败')
+  // #region debug-point body-request
+  if (traceBody) inspectorDebug.log('D', 'api:response', 'body-result', {
+    path, status: response.status, elapsedMs: Math.round(performance.now() - traceStarted),
+    returnedSeqs: Object.keys(body.messages ?? {}).slice(0, 20), nextCursor: body.nextCursor ?? null,
+  })
+  // #endregion debug-point body-request
+  if (!response.ok) throw Object.assign(new Error(body.error ?? '请求失败'), { status: response.status })
   return body
 }
 
 function post(type, payload = {}) {
+  // #region debug-point host-session
+  if (inspectorDebug.enabled && type === 'synapse:activate-session') inspectorDebug.log('A', 'post:activate-session', 'host-activate', { sessionId: payload.sessionId })
+  // #endregion debug-point host-session
   if (window.parent !== window) window.parent.postMessage({ source: 'dsh-synapse', type, ...payload }, window.location.origin)
 }
 
@@ -151,8 +482,11 @@ function messagesFromEvents(events) {
   return events.flatMap(event => {
     const content = event?.data?.message?.content ?? event?.data?.content
     const text = Array.isArray(content) ? content.filter(block => block?.type === 'text').map(block => block.text).filter(Boolean).join('\n') : ''
-    if (event?.type === 'user/message' && text && !text.startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')) return [{ kind: 'user', text, at: event.time, sourceSeq: event.seq }]
-    if (event?.type === 'assistant/message' && text) return [{ kind: 'assistant', text, at: event.time, sourceSeq: event.seq }]
+    const sourceKind = event?.data?.source?.kind
+    const injected = typeof sourceKind === 'string' ? sourceKind !== 'user'
+      : text.trimStart().startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')
+    if (event?.type === 'user/message' && text.trim() && !injected) return [{ kind: 'user', text, at: event.time, sourceSeq: event.seq, ...(typeof sourceKind === 'string' ? { sourceKind } : {}) }]
+    if (event?.type === 'assistant/message') return [{ kind: 'assistant', text, at: event.time, sourceSeq: event.seq, turn: event.data?.turn, step: event.data?.step }]
     return []
   })
 }
@@ -194,9 +528,35 @@ function workspaceChoices() {
 
 async function threadsForDshWorkspace(workspace) {
   if (workspace.sessionIds.length === 0) return []
-  const requested = new Set(workspace.sessionIds)
-  const projections = await Promise.all(state.summaries.map(summary => api(`/synapse/api/workspaces/${summary.id}`)))
-  return projections.flatMap(projection => projection.workspace.threads.filter(thread => requested.has(thread.dshSessionId)))
+  // Stay within the API's 32 KiB request limit even for large DSH groups.
+  // These batches contain selectors only, never unrelated workspace payloads.
+  const batches = []
+  const encoder = new TextEncoder()
+  let batch = []
+  let bytes = encoder.encode('{"sessionIds":[]}').length
+  for (const id of new Set(workspace.sessionIds)) {
+    const size = encoder.encode(JSON.stringify(id)).length + 1
+    if (bytes + size > 32 * 1024) {
+      if (batch.length === 0) throw new Error('会话编号过长')
+      batches.push(batch)
+      batch = []
+      bytes = encoder.encode('{"sessionIds":[]}').length
+    }
+    if (bytes + size > 32 * 1024) throw new Error('会话编号过长')
+    batch.push(id)
+    bytes += size
+  }
+  if (batch.length > 0) batches.push(batch)
+  const threads = []
+  for (const sessionIds of batches) {
+    const body = await api('/synapse/api/threads/query', { method: 'POST', body: JSON.stringify({ sessionIds }) })
+    threads.push(...body.threads)
+  }
+  return threads
+}
+
+function dshWorkspaceProjection(workspace, threads) {
+  return { id: `dsh:${workspace.id}`, title: workspace.title, cwd: workspace.path, threads }
 }
 
 async function openDshWorkspace(id, { renderAfter = true, preserveCanvasCamera = false, userInitiated = false } = {}) {
@@ -210,14 +570,19 @@ async function openDshWorkspace(id, { renderAfter = true, preserveCanvasCamera =
   const load = ++state.workspaceLoad
   if (userInitiated) state.workspaceLoadOwner = 'user'
   state.workspaceLoadBusy = true
+  prepareWorkspaceCaches(`dsh:${id}`)
   try {
     state.selectedDshWorkspaceId = id
+    const summariesSignature = JSON.stringify(state.summaries)
     const threads = await threadsForDshWorkspace(workspace)
-    if (load !== state.workspaceLoad) return true
+    if (load !== state.workspaceLoad || workspace !== selectedDshWorkspace()) return false
     const nextWorkspaceId = `dsh:${workspace.id}`
     if (state.workspace?.id !== nextWorkspaceId && !preserveCanvasCamera) resetCanvasCamera()
-    state.workspace = { id: nextWorkspaceId, title: workspace.title, cwd: workspace.path, threads }
+    state.workspace = dshWorkspaceProjection(workspace, threads)
+    pruneWorkspaceCaches()
     state.workspaceFingerprint = JSON.stringify(state.workspace)
+    state.workspaceSummariesSignature = summariesSignature
+    state.workspaceDshSignature = JSON.stringify(workspace)
     const currentThread = currentDshThread(state.workspace.threads)
     state.activeId = currentThread?.id ?? (state.workspace.threads.some(thread => thread.id === state.activeId) ? state.activeId : state.workspace.threads[0]?.id ?? null)
     if (currentThread !== undefined) revealConversationThread(conversationCards(state.workspace.threads), currentThread.id)
@@ -228,8 +593,11 @@ async function openDshWorkspace(id, { renderAfter = true, preserveCanvasCamera =
     if (userInitiated && load === state.workspaceLoad) window.requestAnimationFrame(() => { if (state.mode === 'canvas') focusActiveCard() })
     return true
   } finally {
-    state.workspaceLoadBusy = false
-    if (userInitiated && load === state.workspaceLoad) state.workspaceLoadOwner = null
+    if (load === state.workspaceLoad) {
+      state.workspaceLoadOwner = null
+      state.workspaceLoadBusy = false
+      void hydrateBodies()
+    }
   }
 }
 
@@ -239,13 +607,14 @@ async function openCurrentWorkspace({ preserveCanvasCamera = false } = {}) {
   return openDshWorkspace(workspace.id, { preserveCanvasCamera })
 }
 
-async function refreshSummaries({ renderAfter = true } = {}) {
+async function refreshSummaries({ renderAfter = true, loadWorkspace = true } = {}) {
   const before = JSON.stringify(state.summaries)
   const body = await api('/synapse/api/workspaces')
   state.summaries = body.workspaces
   const changed = before !== JSON.stringify(state.summaries)
+  if (!loadWorkspace) return changed
   const current = state.workspace?.id
-  if (state.selectedDshWorkspaceId === null && current !== null && !state.summaries.some(item => item.id === current)) state.workspace = null
+  if (state.selectedDshWorkspaceId === null && current !== null && !state.summaries.some(item => item.id === current)) { state.workspace = null; pruneWorkspaceCaches() }
   const selected = selectedDshWorkspace()
   if (selected !== undefined && (changed || state.workspace === null)) await openDshWorkspace(selected.id, { renderAfter })
   else if (state.workspace === null && state.summaries.length > 0) await openWorkspace(state.summaries[0].id)
@@ -255,15 +624,28 @@ async function refreshSummaries({ renderAfter = true } = {}) {
 
 async function openWorkspace(id, { renderAfter = true } = {}) {
   const load = ++state.workspaceLoad
-  const body = await api(`/synapse/api/workspaces/${id}`)
-  if (load !== state.workspaceLoad) return
-  if (state.workspace?.id !== body.workspace.id) resetCanvasCamera()
-  state.workspace = body.workspace
-  state.workspaceFingerprint = JSON.stringify(state.workspace)
-  state.activeId = state.workspace.threads.some(thread => thread.id === state.activeId) ? state.activeId : state.workspace.threads[0]?.id ?? null
-  if (renderAfter && canReplaceView()) render()
-  await Promise.all(state.workspace.threads.map(thread => loadThreadHistory(thread, false)))
-  if (renderAfter && load === state.workspaceLoad && canReplaceView()) render()
+  state.workspaceLoadBusy = true
+  prepareWorkspaceCaches(id)
+  try {
+    const summariesSignature = JSON.stringify(state.summaries)
+    const body = await api(`/synapse/api/workspaces/${id}`)
+    if (load !== state.workspaceLoad) return
+    if (state.workspace?.id !== body.workspace.id) resetCanvasCamera()
+    state.workspace = body.workspace
+    pruneWorkspaceCaches()
+    state.workspaceFingerprint = JSON.stringify(state.workspace)
+    state.workspaceSummariesSignature = summariesSignature
+    state.activeId = state.workspace.threads.some(thread => thread.id === state.activeId) ? state.activeId : state.workspace.threads[0]?.id ?? null
+    if (renderAfter && canReplaceView()) render()
+    await Promise.all(state.workspace.threads.map(thread => loadThreadHistory(thread, false)))
+    if (renderAfter && load === state.workspaceLoad && canReplaceView()) render()
+  } finally {
+    if (load === state.workspaceLoad) {
+      state.workspaceLoadOwner = null
+      state.workspaceLoadBusy = false
+      void hydrateBodies()
+    }
+  }
 }
 
 /**
@@ -274,13 +656,23 @@ async function openWorkspace(id, { renderAfter = true } = {}) {
  */
 async function refreshCurrentWorkspace() {
   const current = state.workspace
-  if (current === null || typeof current.id !== 'string' || !current.id.startsWith('dsh:')) return false
-  const body = await api(`/synapse/api/workspaces/${current.id.slice(4)}`)
-  if (state.workspace !== current) return false
-  const fingerprint = JSON.stringify(body.workspace)
+  if (current === null || state.workspaceLoadBusy || state.workspaceLoadOwner === 'user') return false
+  const load = state.workspaceLoad
+  const selected = selectedDshWorkspace()
+  const summariesSignature = JSON.stringify(state.summaries)
+  const workspace = current.id.startsWith('dsh:')
+    ? (selected === undefined ? null : dshWorkspaceProjection(selected, await threadsForDshWorkspace(selected)))
+    : (await api(`/synapse/api/workspaces/${current.id}`)).workspace
+  if (workspace === null || state.workspace !== current || load !== state.workspaceLoad || state.workspaceLoadBusy || selected !== selectedDshWorkspace() || !canReplaceView()) return false
+  // A failed fetch never advances this signature: the next poll must retry
+  // even if the server's summaries have stopped changing.
+  state.workspaceSummariesSignature = summariesSignature
+  state.workspaceDshSignature = JSON.stringify(selected)
+  const fingerprint = JSON.stringify(workspace)
   if (state.workspaceFingerprint === fingerprint) return false
   state.workspaceFingerprint = fingerprint
-  state.workspace = body.workspace
+  state.workspace = workspace
+  pruneWorkspaceCaches()
   if (!state.workspace.threads.some(thread => thread.id === state.activeId)) {
     state.activeId = state.workspace.threads[0]?.id ?? null
   }
@@ -289,16 +681,37 @@ async function refreshCurrentWorkspace() {
 }
 
 async function refreshProjection() {
-  const summariesChanged = await refreshSummaries({ renderAfter: false })
-  if (!summariesChanged || state.workspace === null || !canReplaceView()) return summariesChanged
-  if (state.workspace.id.startsWith('dsh:')) return (await refreshCurrentWorkspace()) || summariesChanged
-  if (state.selectedDshWorkspaceId !== null) await openDshWorkspace(state.selectedDshWorkspaceId)
-  else await openWorkspace(state.workspace.id)
-  return true
+  if (state.workspaceLoadBusy || state.workspaceLoadOwner === 'user') return false
+  const summariesChanged = await refreshSummaries({ renderAfter: false, loadWorkspace: false })
+  if (state.workspaceLoadBusy || state.workspaceLoadOwner === 'user' || !canReplaceView()) return false
+  const selected = selectedDshWorkspace()
+  let viewRemoved = false
+  if ((state.selectedDshWorkspaceId !== null && selected === undefined) ||
+      (state.selectedDshWorkspaceId === null && state.workspace !== null && !state.summaries.some(item => item.id === state.workspace.id))) {
+    state.selectedDshWorkspaceId = null
+    state.workspace = null
+    pruneWorkspaceCaches()
+    state.activeId = null
+    viewRemoved = true
+  }
+  if (state.workspace === null || (selected !== undefined && state.workspace.id !== `dsh:${selected.id}`)) {
+    const next = selected ?? currentDshWorkspace() ?? state.dshWorkspaces[0]
+    if (next !== undefined) return openDshWorkspace(next.id)
+    if (state.summaries.length > 0) { await openWorkspace(state.summaries[0].id); return true }
+    if (summariesChanged || viewRemoved) render()
+    return summariesChanged || viewRemoved
+  }
+  if (state.workspaceSummariesSignature !== JSON.stringify(state.summaries) ||
+      (selected !== undefined && state.workspaceDshSignature !== JSON.stringify(selected))) return refreshCurrentWorkspace()
+  if (summariesChanged) render()
+  return summariesChanged
 }
 
 function openNewSession() {
   if (state.draft !== null) return
+  // #region debug-point inspector-selection
+  if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'openNewSession', 'new-session')
+  // #endregion debug-point inspector-selection
   state.mode = 'canvas'
   state.activeId = null
   state.selectedCardId = null
@@ -313,6 +726,9 @@ function openNewSession() {
 }
 
 async function archiveThread(thread) {
+  // #region debug-point inspector-selection
+  if (inspectorDebug.enabled) inspectorDebug.log('C', 'archiveThread', 'archive', { threadId: thread.id })
+  // #endregion debug-point inspector-selection
   // A DSH-backed thread is archived in DSH itself, so the sidebar and this map
   // share one archive set (issue #21 / #19). Keeping a second local delete is
   // what made the map claim "archived" while DSH still listed the session.
@@ -325,6 +741,7 @@ async function archiveThread(thread) {
       return
     }
     state.archivedSessionIds.add(thread.dshSessionId)
+    pruneWorkspaceCaches()
     state.activeId = state.activeId === thread.id ? (state.workspace?.threads.find(item => item.id !== thread.id)?.id ?? null) : state.activeId
     if (state.inspectorCardId !== null && state.canvasCardsById?.get(state.inspectorCardId)?.dshThreadId === thread.id) state.inspectorCardId = null
     render()
@@ -348,6 +765,7 @@ async function archiveThread(thread) {
       }
     }
     state.workspace.threads = state.workspace.threads.filter(item => !removed.has(item.id))
+    pruneWorkspaceCaches()
     for (const key of [...state.cardPositions.keys()]) {
       if ([...removed].some(id => key.startsWith(`${id}:`))) state.cardPositions.delete(key)
     }
@@ -398,6 +816,7 @@ async function sendMessage(thread, text) {
   if (thread.dshSessionId === null) throw new Error('该节点没有关联的 DSH 会话')
   if (state.pendingReplies.has(thread.dshSessionId)) throw new Error('该会话正在回复，请稍后再发送')
   state.pendingReplies.set(thread.dshSessionId, { text, at: Date.now() })
+  invalidateCanvasGraph()
   state.error = ''
   render()
   try {
@@ -405,6 +824,7 @@ async function sendMessage(thread, text) {
     void loadThreadHistory(thread)
   } catch (error) {
     state.pendingReplies.delete(thread.dshSessionId)
+    invalidateCanvasGraph()
     render()
     throw error
   }
@@ -443,6 +863,7 @@ async function submitDraft() {
     state.activeId = result.thread.id
     state.draft = null
     state.pendingReplies.set(result.thread.dshSessionId, { text, at: Date.now() })
+    invalidateCanvasGraph()
     render()
     await dshRpc('synapse:send-message', { sessionId: result.thread.dshSessionId, text })
     void loadThreadHistory(result.thread)
@@ -450,6 +871,7 @@ async function submitDraft() {
   } catch (error) {
     if (draft.kind === 'branch') {
       state.pendingReplies.delete(state.workspace?.threads.find(thread => thread.id === state.activeId)?.dshSessionId)
+      invalidateCanvasGraph()
       if (state.draft !== null) state.draft = { ...draft, sending: false }
     } else {
       state.draft = { ...draft, sending: false }
@@ -484,24 +906,16 @@ function settlePendingReply(thread, messages) {
   const pending = state.pendingReplies.get(thread.dshSessionId)
   if (pending === undefined) return false
   const userIndex = pendingUserIndex(messages, pending)
-  if (userIndex === -1 || !messages.slice(userIndex + 1).some(message => message.kind === 'assistant')) return false
+  if (userIndex === -1 || !messages.slice(userIndex + 1).some(message => message.kind === 'error' || message.kind === 'assistant' && message.text?.trim())) return false
   state.pendingReplies.delete(thread.dshSessionId)
   return true
 }
 
-function messagesFor(thread) {
-  // A runtime-context snapshot is internal DSH state, never a user turn.
-  // Filter here as well as during persistence so existing saved workspaces
-  // immediately render one question and its answer as one card.
-  const stored = persistedMessagesFor(thread).filter(message => !(message.kind === 'user' && typeof message.text === 'string' && message.text.trimStart().startsWith('Current runtime context. This snapshot supersedes earlier runtime-context snapshots.')))
+function messagesFor(thread, hydrate = true) {
+  // Old rows without provenance are repaired against the original log.
+  const stored = persistedMessagesFor(thread).filter(message => !(message.kind === 'user' && typeof message.sourceKind === 'string' && message.sourceKind !== 'user'))
   // Swap in hydrated bodies where present: the stored text is only a preview.
-  const bodies = state.bodies.get(thread.id)
-  const messages = bodies === undefined || bodies.size === 0
-    ? stored
-    : stored.map(message => {
-      const body = bodies.get(message.sourceSeq)
-      return body === undefined ? message : { ...message, text: body.text, process: Array.isArray(body.process) ? body.process : message.process, truncated: body.truncated === true, hydrated: true }
-    })
+  const messages = hydrate ? stored.map(message => hydratedMessage(thread, message)) : stored
   const pending = state.pendingReplies.get(thread.dshSessionId)
   if (pending === undefined) return messages
   if (settlePendingReply(thread, messages)) {
@@ -515,7 +929,7 @@ function messagesFor(thread) {
   return [...messages, { kind: 'user', text: pending.text, pending: true, at: new Date(pending.at).toISOString() }, liveAssistant]
 }
 
-function latestMessage(thread, kind) { return [...messagesFor(thread)].reverse().find(message => message.kind === kind) }
+function latestMessage(thread, kind) { return hydratedMessage(thread, [...messagesFor(thread, false)].reverse().find(message => message.kind === kind && (kind !== 'assistant' || message.text?.trim()))) }
 function questionFor(thread) { return latestMessage(thread, 'user')?.text ?? thread.dshSessionTitle ?? '等待用户提问' }
 function answerFor(thread) { return latestMessage(thread, 'assistant') ?? null }
 
@@ -587,19 +1001,19 @@ function markdownBlock(text) {
 
 // Markdown parsing is pure CPU and repeats for every card on every canvas
 // rebuild; cache the rendered HTML by input text so stable answers are never
-// re-parsed. Bounded: streaming partial texts churn keys, so evict oldest.
-const markdownCache = new Map()
-const MARKDOWN_CACHE_LIMIT = 5000
-function renderMarkdown(text) {
+// re-parsed. Count the input key and HTML, not just the number of entries.
+const MARKDOWN_CACHE_LIMIT = SynapseCache.LIMITS.markdownEntries
+const markdownCache = new SynapseCache.ByteLru(SynapseCache.LIMITS.markdownBytes, MARKDOWN_CACHE_LIMIT)
+function renderMarkdown(text, cache = true) {
   const key = String(text)
-  const cached = markdownCache.get(key)
+  const cached = cache ? markdownCache.get(key) : undefined
   if (cached !== undefined) return cached
   const parts = key.split(/```/)
   const rendered = parts.map((part, index) => index % 2 === 1
     ? `<pre><code>${escapeHtml(part.replace(/^\w*\n/, ''))}</code></pre>`
     : markdownBlock(part)).join('')
-  if (markdownCache.size >= MARKDOWN_CACHE_LIMIT) markdownCache.delete(markdownCache.keys().next().value)
-  markdownCache.set(key, rendered)
+  const bytes = SynapseCache.textBytes(key) + SynapseCache.textBytes(rendered) + 128
+  if (cache && bytes <= SynapseCache.LIMITS.markdownEntryBytes) markdownCache.set(key, rendered, SynapseCache.textBytes(rendered))
   return rendered
 }
 
@@ -695,15 +1109,24 @@ function placeConversationCards(cards) {
     const position = state.cardPositions.get(card.id) ?? state.cardPositions.get(card.positionKey)
     return position === undefined ? [] : [[card.id, { x: position.x, y: position.y }]]
   }))
-  const occupied = []
+  const occupied = new SynapseCache.RegionIndex()
   for (const card of cards) {
     const position = saved.get(card.id)
     if (position !== undefined) {
       card.position = position
       continue
     }
-    card.position = firstAvailableCardPosition(card.naturalPosition ?? card.position, occupied)
-    occupied.push(card.position)
+    const candidate = { ...(card.naturalPosition ?? card.position) }
+    candidate.x = Math.round(candidate.x)
+    candidate.y = Math.max(82, Math.round(candidate.y))
+    while (true) {
+      const collisions = occupied.query({ left: candidate.x, right: candidate.x + CARD_WIDTH, top: candidate.y, bottom: candidate.y + CARD_HEIGHT })
+        .filter(other => overlapsCard(candidate, other.position))
+      if (collisions.length === 0) break
+      candidate.y = Math.max(...collisions.map(other => other.position.y + CARD_HEIGHT + CARD_GAP_Y))
+    }
+    card.position = candidate
+    occupied.set(card)
   }
   return cards
 }
@@ -718,28 +1141,38 @@ function layoutConversationGraph(cards, threads) {
   }
   const laneByThread = new Map()
   const visitThread = threadId => {
-    if (laneByThread.has(threadId)) return
-    laneByThread.set(threadId, laneByThread.size)
-    for (const childId of childrenByThread.get(threadId) ?? []) visitThread(childId)
+    const stack = [threadId]
+    while (stack.length > 0) {
+      const id = stack.pop()
+      if (laneByThread.has(id)) continue
+      laneByThread.set(id, laneByThread.size)
+      const children = childrenByThread.get(id) ?? []
+      for (let index = children.length - 1; index >= 0; index--) stack.push(children[index])
+    }
   }
   for (const thread of threads) if (thread.parentId === null) visitThread(thread.id)
   for (const thread of threads) visitThread(thread.id)
 
   const byId = new Map(cards.map(card => [card.id, card]))
   const positioned = new Map()
-  const positionFor = (card, visiting = new Set()) => {
-    if (positioned.has(card.id)) return positioned.get(card.id)
-    if (visiting.has(card.id)) return { x: 86, y: 82 + (laneByThread.get(card.dshThreadId) ?? 0) * (CARD_HEIGHT + CARD_GAP_Y) }
-    visiting.add(card.id)
-    const parent = card.parentId === null ? undefined : byId.get(card.parentId)
-    const parentPosition = parent === undefined ? undefined : positionFor(parent, visiting)
-    const position = {
-      x: parentPosition === undefined ? 86 : parentPosition.x + 365,
-      y: 82 + (laneByThread.get(card.dshThreadId) ?? 0) * (CARD_HEIGHT + CARD_GAP_Y),
+  const positionFor = card => {
+    const chain = []
+    const visiting = new Set()
+    let current = card
+    while (current !== undefined && !positioned.has(current.id) && !visiting.has(current.id)) {
+      visiting.add(current.id)
+      chain.push(current)
+      current = current.parentId === null ? undefined : byId.get(current.parentId)
     }
-    visiting.delete(card.id)
-    positioned.set(card.id, position)
-    return position
+    let parentPosition = current === undefined ? undefined : positioned.get(current.id)
+    while (chain.length > 0) {
+      const next = chain.pop()
+      const position = { x: parentPosition === undefined ? 86 : parentPosition.x + 365,
+        y: 82 + (laneByThread.get(next.dshThreadId) ?? 0) * (CARD_HEIGHT + CARD_GAP_Y) }
+      positioned.set(next.id, position)
+      parentPosition = position
+    }
+    return positioned.get(card.id)
   }
   for (const card of cards) {
     card.naturalPosition = positionFor(card)
@@ -751,24 +1184,29 @@ function layoutConversationGraph(cards, threads) {
 function conversationCards(threads) {
   const cards = []
   const cardsByThread = new Map()
+  const threadIndex = new Map(threads.map(thread => [thread.id, thread]))
   for (const thread of threads) {
-    const messages = messagesFor(thread)
+    // Retained graph cards contain previews only. Hydrate an ephemeral card
+    // for rendering, so cache eviction really releases body references.
+    const messages = messagesFor(thread, false)
     const turns = []
     for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
       const question = messages[messageIndex]
       if (question.kind !== 'user') continue
       const replies = []
       const errors = []
+      const turnMessages = [question]
       let processCount = 0
       for (let replyIndex = messageIndex + 1; replyIndex < messages.length; replyIndex++) {
         const reply = messages[replyIndex]
         if (reply.kind === 'user') break
+        turnMessages.push(reply)
         if (reply.kind === 'assistant') replies.push(reply)
         if (reply.kind === 'error') errors.push(reply)
         if (Array.isArray(reply.process)) processCount += reply.process.length
         else if (reply.kind === 'tool') processCount += 1
       }
-      const answer = replies.at(-1) ?? null
+      const answer = replies.findLast(reply => reply.text?.trim()) ?? null
       const error = errors.at(-1) ?? null
       const turnIndex = turns.length
       const id = `${thread.id}:turn:${question.sourceSeq ?? messageIndex}`
@@ -791,6 +1229,7 @@ function conversationCards(threads) {
         positionLocked,
         question: question.text,
         questionMessage: question,
+        turnMessages,
         answer,
         error,
         processCount,
@@ -800,6 +1239,11 @@ function conversationCards(threads) {
     const latestTurn = turns.at(-1)
     if (liveReply?.running && latestTurn !== undefined && (latestTurn.answer === null || latestTurn.answer.pending === true)) latestTurn.answer = { kind: 'assistant', text: liveReply.text, pending: true, at: new Date().toISOString() }
     if (turns.length === 0) {
+      // A DSH session containing only execution/context has no user turn.
+      if (typeof thread.dshSessionId === 'string') {
+        cardsByThread.set(thread.id, turns)
+        continue
+      }
       const id = `${thread.id}:turn:empty`
       const positionKey = `${thread.id}:turn-index:0`
       const naturalPosition = { x: 86, y: 82 }
@@ -831,7 +1275,7 @@ function conversationCards(threads) {
     if (card.turnIndex > 0) card.parentId = siblings[card.turnIndex - 1].id
     else {
       const parentCards = cardsByThread.get(card.sourceParentId)
-      const sourceThread = threads.find(thread => thread.id === card.dshThreadId)
+      const sourceThread = threadIndex.get(card.dshThreadId)
       const firstChildQuestion = siblings?.[0]
       const seedLength = sourceThread?.sourceSeedLength ?? firstChildQuestion?.sourceSeq
       // A fork inherits every parent event before DSH's durable seed boundary.
@@ -860,15 +1304,15 @@ function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds)
   for (const rootId of collapsedCardIds) {
     if (!cardIds.has(rootId)) continue
     const visited = new Set([rootId])
-    const visit = parentId => {
-      for (const childId of childrenByParent.get(parentId) ?? []) {
+    const pending = [rootId]
+    while (pending.length > 0) {
+      for (const childId of childrenByParent.get(pending.pop()) ?? []) {
         if (visited.has(childId)) continue
         visited.add(childId)
         hiddenIds.add(childId)
-        visit(childId)
+        pending.push(childId)
       }
     }
-    visit(rootId)
   }
 
   // Persisted collapse roots must remain visible even if malformed metadata
@@ -968,7 +1412,8 @@ function canvasConnectors(cards) {
   return links.join('')
 }
 
-function conversationCard(card, graph) {
+function conversationCard(card, graph, overview = false) {
+  if (!overview) card = hydratedCard(card)
   const selected = card.id === state.selectedCardId ? 'selected' : ''
   const source = card.parentId === null ? 'DSH 会话' : card.turnIndex === 0 ? 'DSH 分支' : '追问'
   const continueButton = card.canContinue === true
@@ -979,12 +1424,18 @@ function conversationCard(card, graph) {
   const foldLabel = collapsed ? '展开后续对话' : '折叠后续对话'
   const foldButton = childCount === 0 || card.canContinue === true ? '' : `<button class="graph-fold-button${collapsed ? ' collapsed' : ''}" data-action="toggle-card-children" data-card="${escapeHtml(card.id)}" aria-expanded="${collapsed ? 'false' : 'true'}" aria-label="${foldLabel}" title="${foldLabel}"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3.5 8h9"/>${collapsed ? '<path d="M8 3.5v9"/>' : ''}</svg></button>`
   const branchButton = childCount === 0 || card.canContinue === true || !Number.isInteger(card.answer?.sourceSeq) ? '' : `<button class="graph-branch-button" data-action="open-branch" data-thread="${card.dshThreadId}" data-card="${escapeHtml(card.id)}" data-seq="${card.answer.sourceSeq}" aria-label="在新对话中分支" title="在新对话中分支"><svg aria-hidden="true" viewBox="0 0 16 16"><path fill-rule="evenodd" clip-rule="evenodd" d="M13.0762 1.37207C14.0846 1.37228 14.9021 2.19077 14.9023 3.19922C14.9022 4.20772 14.0847 5.02518 13.0762 5.02539C12.2967 5.02539 11.6325 4.53691 11.3701 3.84961H4.35547C4.79397 4.26458 5.15861 4.7644 5.41699 5.33496L7.10645 9.06738C7.88526 10.7875 9.55104 11.9228 11.4189 12.0371C11.7085 11.4109 12.3411 10.9756 13.0762 10.9756C14.0843 10.9759 14.9023 11.7936 14.9023 12.8018C14.9023 13.81 14.0843 14.6277 13.0762 14.6279C12.2534 14.6279 11.5574 14.0832 11.3291 13.335C8.9868 13.1879 6.89981 11.7612 5.92285 9.60352L4.23242 5.87109C3.67503 4.64033 2.44878 3.84961 1.09766 3.84961V2.54883C1.10665 2.54883 1.11601 2.54975 1.125 2.5498L11.3701 2.54883C11.6326 1.86151 12.2969 1.37207 13.0762 1.37207ZM13.0762 12.2764C12.7858 12.2764 12.5508 12.5114 12.5508 12.8018C12.5508 13.0921 12.7858 13.3281 13.0762 13.3281C13.3664 13.3279 13.6025 13.092 13.6025 12.8018C13.6025 12.5115 13.3664 12.2766 13.0762 12.2764ZM13.0762 2.67285C12.7855 2.67285 12.55 2.90861 12.5498 3.19922C12.5499 3.48987 12.7855 3.72559 13.0762 3.72559C13.3667 3.72538 13.6024 3.48975 13.6025 3.19922C13.6023 2.90874 13.3666 2.67306 13.0762 2.67285Z" fill="currentColor"/></svg></button>`
-  return `<article class="thread-card ${selected}" data-card-id="${escapeHtml(card.id)}" data-position-key="${escapeHtml(card.positionKey)}" data-thread="${card.dshThreadId}" style="left:${card.position.x}px;top:${card.position.y}px;--thread-color:#3478f6">
-    <button class="node-handle" data-drag-card="${card.id}" aria-label="拖动 ${escapeHtml(card.question)}" title="拖动卡片"></button>
+  const answerText = String(card.answer?.text ?? '')
+  const faceAnswer = overview
+    ? `<p class="card-overview-summary">${escapeHtml(answerText.slice(0, 180) || (card.error === null ? '等待助手回复' : '本轮未完成'))}</p>`
+    : card.answer === null ? (card.error === null ? '<p class="thread-answer-empty">等待助手回复</p>' : '')
+      : `${renderMarkdown(answerText.slice(0, MAP_FACE_TEXT), !card.answer.pending)}${answerText.length > MAP_FACE_TEXT ? '<p class="card-face-notice">点击卡片查看完整回答</p>' : ''}${card.answer.pending ? '<p class="thread-answer-pending">正在回复</p>' : ''}`
+  const question = String(card.question ?? '').slice(0, 800)
+  return `<article class="thread-card ${selected}${overview ? ' card-overview' : ''}" data-card-id="${escapeHtml(card.id)}" data-position-key="${escapeHtml(card.positionKey)}" data-thread="${card.dshThreadId}" style="left:${card.position.x}px;top:${card.position.y}px;--thread-color:#3478f6">
+    <button class="node-handle" data-drag-card="${card.id}" aria-label="拖动 ${escapeHtml(question)}" title="拖动卡片"></button>
     ${continueButton}${foldButton}${branchButton}
-    <div class="thread-card-head"><span class="topic-dot"></span><button class="thread-title" data-action="show-thread" data-thread="${card.dshThreadId}" data-card="${escapeHtml(card.id)}" title="查看完整会话：${escapeHtml(card.question)}">${escapeHtml(card.question)}</button></div>
+    <div class="thread-card-head"><span class="topic-dot"></span><button class="thread-title" data-action="show-thread" data-thread="${card.dshThreadId}" data-card="${escapeHtml(card.id)}" title="查看完整会话：${escapeHtml(question)}">${escapeHtml(question)}</button></div>
     <div class="thread-meta"><span>${source}</span><span>第 ${card.turnIndex + 1} 轮</span>${card.error === null ? '' : '<span class="card-error-status">失败</span>'}${card.processCount > 0 ? `<span class="card-process-count">工具 ${card.processCount}</span>` : ''}</div>
-    <div class="thread-answer">${card.answer === null ? (card.error === null ? '<p class="thread-answer-empty">等待助手回复</p>' : '') : card.answer.pending && card.answer.text === '' ? '<p class="thread-answer-pending">正在回复</p>' : `${renderMarkdown(card.answer.text)}${card.answer.pending ? '<p class="thread-answer-pending">正在回复</p>' : ''}`}${card.error === null ? '' : `<p class="thread-answer-error" title="${escapeHtml(card.error.text)}">本轮失败：${escapeHtml(card.error.text)}</p>`}</div>
+    <div class="thread-answer">${faceAnswer}${card.error === null ? '' : `<p class="thread-answer-error">本轮失败：${escapeHtml(String(card.error.text ?? '').slice(0, 300))}</p>`}</div>
     <footer><button data-action="show-thread" data-thread="${card.dshThreadId}" data-card="${escapeHtml(card.id)}" title="查看完整会话" aria-label="查看完整会话"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M2 8.5 8 2.5l6 6V13.5a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5Z"/><path d="M6.2 14v-3.6a1.8 1.8 0 0 1 3.6 0V14" /></svg>详情</button><button data-action="open-dsh" data-thread="${card.dshThreadId}" data-seq="${Number.isInteger(card.sourceSeq) ? card.sourceSeq : ''}" title="在 DSH 中打开" aria-label="在 DSH 中打开"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5H4.5A1.5 1.5 0 0 0 3 5v6.5A1.5 1.5 0 0 0 4.5 13H11a1.5 1.5 0 0 0 1.5-1.5V9"/><path d="M9.5 3.5h3v3M12.4 3.6 7.5 8.5"/></svg>DSH</button><button data-action="archive-thread" data-thread="${card.dshThreadId}" title="归档此会话" aria-label="归档此会话"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5h11M5.5 7v5.5a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1V7"/><path d="M4 5 5 2.8a.7.7 0 0 1 .6-.4h4.8a.7.7 0 0 1 .6.4L12 5M6 9.5h4"/></svg>归档</button></footer>
   </article>`
 }
@@ -1077,63 +1528,282 @@ function selectionFollowupButton() {
   return `<button class="selection-followup" type="button" data-action="follow-selection" hidden aria-label="基于所选内容创建追问" title="基于所选内容追问"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 3.5h10v6.25H7.2L4 12.5V9.75H3Z"/><path d="M8 4.9v3.4M6.3 6.6h3.4"/></svg><span>追问</span></button>`
 }
 
-// Cards are mounted into the DOM only when they intersect the viewport
-// (inflated by VIEWPORT_MARGIN) in world coordinates. The camera transform is
-// translate(camera) scale(zoom), so screen = world * zoom + camera.
-function visibleCardIds(cards) {
-  const viewport = document.querySelector('.canvas-viewport')
-  if (!(viewport instanceof HTMLElement)) return new Set(cards.map(card => card.id))
-  const bounds = viewport.getBoundingClientRect()
-  const left = (-state.canvasCamera.x - VIEWPORT_MARGIN) / state.zoom
-  const right = (bounds.width - state.canvasCamera.x + VIEWPORT_MARGIN) / state.zoom
-  const top = (-state.canvasCamera.y - VIEWPORT_MARGIN) / state.zoom
-  const bottom = (bounds.height - state.canvasCamera.y + VIEWPORT_MARGIN) / state.zoom
-  const visible = new Set()
-  for (const card of cards) {
-    const { x, y } = card.position
-    if (x + CARD_WIDTH < left || x > right || y + CARD_HEIGHT < top || y > bottom) continue
-    visible.add(card.id)
-  }
-  return visible
+let canvasGraphRevision = 0
+let canvasGraphCache = null
+let regionTimer = 0
+let regionWorkTimer = 0
+let regionGeneration = 0
+let regionView = null
+const regionElements = new Map()
+const regionDirtyCards = new Set()
+let inspectorBodyTimer = 0
+
+function invalidateCanvasGraph() { canvasGraphRevision++ }
+function cancelRegionWork() {
+  window.clearTimeout(regionTimer)
+  window.clearTimeout(regionWorkTimer)
+  window.clearTimeout(inspectorBodyTimer)
+  regionTimer = regionWorkTimer = inspectorBodyTimer = 0
+  regionGeneration++
+  regionDirtyCards.clear()
 }
 
-// Incrementally mount cards entering the viewport and unmount cards leaving
-// it, without rebuilding the canvas. Called after pan/zoom/focus camera moves.
-function syncCanvasViewport() {
-  if (state.mode !== 'canvas' || state.canvasCards === undefined) return
+function ensureCanvasGraph(threads) {
+  if (canvasGraphCache?.workspace === state.workspace && canvasGraphCache.revision === canvasGraphRevision) return
+  const allCards = conversationCards(threads)
+  const graph = conversationGraphView(allCards)
+  const index = new SynapseCache.RegionIndex()
+  const children = new Map()
+  const byMessage = new Map()
+  const latestByThread = new Map()
+  for (const card of allCards) latestByThread.set(card.dshThreadId, card)
+  for (const card of graph.cards) {
+    index.set(card)
+    if (card.parentId !== null) {
+      if (!children.has(card.parentId)) children.set(card.parentId, [])
+      children.get(card.parentId).push(card.id)
+    }
+    for (const message of [card.questionMessage, card.answer, card.error]) {
+      if (Number.isInteger(message?.sourceSeq)) byMessage.set(`${card.dshThreadId}:${message.sourceSeq}`, card.id)
+    }
+  }
+  canvasGraphCache = { workspace: state.workspace, revision: canvasGraphRevision, graph, index, children, byMessage,
+    allById: new Map(allCards.map(card => [card.id, card])), latestByThread,
+    threadById: new Map(threads.map(thread => [thread.id, thread])) }
+  state.canvasCards = graph.cards
+  state.canvasCardsById = new Map(graph.cards.map(card => [card.id, card]))
+  state.canvasGraph = graph
+}
+
+function canvasWorldBounds(margin = 0) {
+  const viewport = document.querySelector('.canvas-viewport')
+  if (!(viewport instanceof HTMLElement)) return null
+  const width = viewport.clientWidth
+  const height = viewport.clientHeight
+  if (width === 0 || height === 0) return null
+  return { left: -state.canvasCamera.x / state.zoom - margin,
+    right: (width - state.canvasCamera.x) / state.zoom + margin,
+    top: -state.canvasCamera.y / state.zoom - margin,
+    bottom: (height - state.canvasCamera.y) / state.zoom + margin }
+}
+
+function cardIntersects(card, bounds) {
+  return card.position.x + CARD_WIDTH >= bounds.left && card.position.x <= bounds.right
+    && card.position.y + CARD_HEIGHT >= bounds.top && card.position.y <= bounds.bottom
+}
+
+// Throttle region planning independently of the camera's animation frame.
+// Each pending plan reads the latest camera, so rapid panning drops old work.
+function syncCanvasViewport({ immediate = false } = {}) {
+  if (state.mode !== 'canvas' || !state.mapVisible || document.hidden || !canvasGraphCache) return
+  if (immediate) {
+    window.clearTimeout(regionTimer)
+    regionTimer = 0
+    planCanvasRegion()
+  } else if (regionTimer === 0) {
+    regionTimer = window.setTimeout(() => { regionTimer = 0; planCanvasRegion() }, REGION_TICK_MS)
+  }
+}
+
+function planCanvasRegion() {
+  if (state.mode !== 'canvas' || !state.mapVisible || document.hidden || state.dragging) return
+  const bounds = canvasWorldBounds()
+  const layer = document.querySelector('.cards-layer')
+  if (!bounds || !(layer instanceof HTMLElement) || !canvasGraphCache) return
+  const planKey = [canvasGraphCache.revision, state.zoom < OVERVIEW_ZOOM, state.selectedCardId, state.activeId,
+    state.inspectorCardId, state.canvasGesture, state.draft?.kind, state.draft?.anchorId,
+    ...['left', 'right', 'top', 'bottom'].map(side => Math.floor(bounds[side] / 128))].join('|')
+  if (regionView?.planKey === planKey && regionDirtyCards.size === 0) {
+    hydrateBodies()
+    updateRegionStatus()
+    return
+  }
+  window.clearTimeout(regionWorkTimer)
+  regionWorkTimer = 0
+  const generation = ++regionGeneration
+  const expanded = { left: bounds.left - REGION_MARGIN, right: bounds.right + REGION_MARGIN,
+    top: bounds.top - REGION_MARGIN, bottom: bounds.bottom + REGION_MARGIN }
+  const nearby = canvasGraphCache.index.query(expanded)
+  const cx = (bounds.left + bounds.right) / 2
+  const cy = (bounds.top + bounds.bottom) / 2
+  const distance = card => (card.position.x + CARD_WIDTH / 2 - cx) ** 2 + (card.position.y + CARD_HEIGHT / 2 - cy) ** 2
+  nearby.sort((a, b) => Number(cardIntersects(b, bounds)) - Number(cardIntersects(a, bounds)) || distance(a) - distance(b))
+  const overview = state.zoom < OVERVIEW_ZOOM
+  const limit = overview ? MAP_OVERVIEW_CARDS : MAP_DETAIL_CARDS
+  const wanted = nearby.slice(0, limit)
+  const ids = new Set(wanted.map(card => card.id))
+  regionView = { planKey, overview, cards: wanted, ids, bounds, total: nearby.length, queue: [], prefetch: [] }
+  for (const [id, element] of regionElements) {
+    if (!element.isConnected || !ids.has(id)) {
+      element.remove()
+      regionElements.delete(id)
+      state.mountedCardIds.delete(id)
+      regionDirtyCards.delete(id)
+    }
+  }
+  // Reuse live DOM after shell renders and discard references from old views.
+  for (const element of layer.querySelectorAll('.thread-card[data-thread]')) {
+    const id = element.dataset.cardId
+    if (!ids.has(id)) { element.remove(); state.mountedCardIds.delete(id); continue }
+    regionElements.set(id, element)
+    state.mountedCardIds.add(id)
+  }
+  for (const card of wanted) {
+    const element = regionElements.get(card.id)
+    const stamp = `${canvasGraphCache.revision}:${overview}:${card.id === state.selectedCardId}`
+    if (!element || element.dataset.regionStamp !== stamp || regionDirtyCards.has(card.id)) regionView.queue.push(card.id)
+  }
+  if (!overview && !state.canvasGesture) {
+    const prefetchBounds = { left: bounds.left - REGION_PREFETCH_MARGIN, right: bounds.right + REGION_PREFETCH_MARGIN,
+      top: bounds.top - REGION_PREFETCH_MARGIN, bottom: bounds.bottom + REGION_PREFETCH_MARGIN }
+    regionView.prefetch = canvasGraphCache.index.query(prefetchBounds).filter(card => !ids.has(card.id))
+      .sort((a, b) => distance(a) - distance(b)).slice(0, 12)
+  }
+  refreshRegionConnectors()
+  hydrateBodies()
+  updateRegionStatus()
+  regionWorkTimer = window.setTimeout(() => mountRegionBatch(generation), 0)
+}
+
+function patchElementHtml(element, html) {
+  const template = document.createElement('template')
+  template.innerHTML = html
+  const next = template.content.firstElementChild
+  morphFrozenRoot = morphFrozenRootOfDocument()
+  try { return morphNode(element, next) } finally { morphFrozenRoot = null }
+}
+
+function mountRegionBatch(generation) {
+  if (generation !== regionGeneration || !regionView || state.mode !== 'canvas' || !state.mapVisible || document.hidden) return
+  regionWorkTimer = 0
   const layer = document.querySelector('.cards-layer')
   if (!(layer instanceof HTMLElement)) return
-  const visible = visibleCardIds(state.canvasCards)
-  for (const cardId of [...state.mountedCardIds]) {
-    if (visible.has(cardId)) continue
-    const element = layer.querySelector(`[data-card-id="${selectorValue(cardId)}"]`)
-    if (element instanceof HTMLElement) element.remove()
-    state.mountedCardIds.delete(cardId)
-  }
-  for (const card of state.canvasCards) {
-    if (!visible.has(card.id) || state.mountedCardIds.has(card.id)) continue
-    const wrapper = document.createElement('div')
-    wrapper.innerHTML = conversationCard(card, state.canvasGraph)
-    const element = wrapper.firstElementChild
-    if (element instanceof HTMLElement) {
+  const started = performance.now()
+  let count = 0
+  while (regionView.queue.length > 0 && count < (regionView.overview ? 20 : 6)) {
+    if (count > 0 && performance.now() - started >= 6) break
+    const id = regionView.queue.shift()
+    const card = state.canvasCardsById.get(id)
+    if (!card) continue
+    const html = conversationCard(card, state.canvasGraph, regionView.overview)
+    let element = regionElements.get(id)
+    if (element?.isConnected) {
+      const scroll = element.querySelector('.thread-answer')?.scrollTop ?? 0
+      element = patchElementHtml(element, html)
+      const answer = element.querySelector('.thread-answer')
+      if (answer) answer.scrollTop = scroll
+    } else {
+      const template = document.createElement('template')
+      template.innerHTML = html
+      element = template.content.firstElementChild
       layer.appendChild(element)
-      const handle = element.querySelector('[data-drag-card]')
-      if (handle instanceof HTMLElement) bindDragHandle(handle)
     }
-    state.mountedCardIds.add(card.id)
+    element.dataset.regionStamp = `${canvasGraphCache.revision}:${regionView.overview}:${card.id === state.selectedCardId}`
+    regionElements.set(id, element)
+    state.mountedCardIds.add(id)
+    regionDirtyCards.delete(id)
+    const handle = element.querySelector('[data-drag-card]')
+    if (handle instanceof HTMLElement) bindDragHandle(handle)
+    count++
+  }
+  updateRegionStatus()
+  if (regionView.queue.length > 0) regionWorkTimer = window.setTimeout(() => mountRegionBatch(generation), 16)
+}
+
+function refreshRegionConnectors() {
+  const svg = document.querySelector('.connectors')
+  if (!svg || !regionView) return
+  const placement = draftPlacement(state.canvasCards)
+  const linksKey = [canvasGraphCache.revision, state.activeId, ...regionView.ids,
+    placement?.parent.position.x, placement?.parent.position.y, placement?.position.x, placement?.position.y].join('|')
+  if (svg.dataset.regionLinksKey === linksKey) return
+  svg.dataset.regionLinksKey = linksKey
+  const edges = new Set()
+  const links = []
+  const add = id => {
+    if (edges.has(id) || links.length >= 640) return
+    edges.add(id)
+    const card = state.canvasCardsById.get(id)
+    const parent = state.canvasCardsById.get(card?.parentId)
+    if (!card || !parent) return
+    const active = card.dshThreadId === state.activeId && parent.dshThreadId === state.activeId
+    links.push(`<path data-morph-key="${escapeHtml(card.id)}" class="${active ? 'active-connector' : ''}" data-from="${escapeHtml(parent.id)}" data-to="${escapeHtml(card.id)}" d="${connectorPath(parent.position, card.position)}"></path>`)
+  }
+  for (const card of regionView.cards) {
+    add(card.id)
+    for (const child of canvasGraphCache.children.get(card.id) ?? []) {
+      if (regionView.ids.has(child)) add(child)
+      if (links.length >= 640) break
+    }
+  }
+  if (placement) links.push(`<path class="draft-connector" data-from="${escapeHtml(placement.parent.id)}" data-to="draft" d="${connectorPath(placement.parent.position, placement.position)}"></path>`)
+  // SVG parsing needs the SVG namespace, which a bare HTML template lacks.
+  const template = document.createElement('template')
+  template.innerHTML = `<svg>${links.join('')}</svg>`
+  morphChildren(svg, template.content.firstElementChild)
+  cacheCardConnectors()
+}
+
+function updateRegionStatus() {
+  const status = document.querySelector('.region-status')
+  if (!status || !regionView) return
+  let pending = 0
+  let unavailable = 0
+  for (const entry of bodyLoader.wanted.values()) {
+    if (entry.priority === 2 || bodyCache.get(entry.threadId, entry.seq, entry.revision) !== undefined) continue
+    if (bodyLoader.unavailable(entry.threadId, entry.seq, entry.revision)) unavailable++
+    else pending++
+  }
+  const mounting = regionView.queue.length
+  const limited = regionView.total > regionView.cards.length
+  const loading = mounting > 0 || pending > 0
+  status.hidden = !loading && !unavailable && !limited && !regionView.overview
+  status.classList.toggle('is-loading', loading)
+  status.querySelector('span').textContent = loading ? `正在加载此区域 · ${mounting ? `${mounting} 张卡片` : `${pending} 条正文`}`
+    : unavailable ? '部分正文暂未加载，当前显示预览'
+      : limited ? `当前区域显示 ${regionView.cards.length} 张卡片，请放大查看`
+        : '概览模式 · 点击卡片查看完整回答'
+  status.querySelector('button').hidden = unavailable === 0
+}
+
+function syncCanvasDraft() {
+  const layer = document.querySelector('.cards-layer')
+  if (!layer) return
+  const previous = layer.querySelector('.draft-card')
+  const html = draftCard(state.canvasCards ?? [])
+  if (!html) { previous?.remove(); return }
+  if (previous) patchElementHtml(previous, html)
+  else {
+    const template = document.createElement('template')
+    template.innerHTML = html
+    layer.appendChild(template.content)
   }
 }
 
 function renderCanvas() {
   const threads = visibleThreads(state.workspace?.threads ?? [])
-  if (threads.length === 0 && state.draft?.kind !== 'new') return `<section class="empty-canvas"><strong>当前工作目录还没有 DSH 对话。</strong><p>点击新会话，在画布中输入第一条消息。</p><div><button class="primary" type="button" data-action="create-session">新建会话</button></div></section>`
-  const allCards = conversationCards(threads)
-  const graph = conversationGraphView(allCards)
-  const cards = graph.cards
-  state.canvasCards = cards
-  state.canvasCardsById = new Map(cards.map(card => [card.id, card]))
-  state.canvasGraph = graph
-  if (state.inspectorCardId !== null && !state.canvasCardsById.has(state.inspectorCardId)) {
+  // #region debug-point graph-render
+  if (inspectorDebug.enabled && threads.length === 0) inspectorDebug.log('B', 'renderCanvas:empty', 'graph-check', { threadCount: 0 })
+  // #endregion debug-point graph-render
+  if (threads.length === 0 && state.draft?.kind !== 'new') {
+    clearViewCaches()
+    state.inspectorCardId = null
+    state.inspectorOpening = false
+    return `<section class="empty-canvas"><strong>当前工作目录还没有 DSH 对话。</strong><p>点击新会话，在画布中输入第一条消息。</p><div><button class="primary" type="button" data-action="create-session">新建会话</button></div></section>`
+  }
+  ensureCanvasGraph(threads)
+  const cards = state.canvasCards
+  // #region debug-point graph-render
+  if (inspectorDebug.enabled && state.inspectorCardId !== null) inspectorDebug.log('B', 'renderCanvas:graph', 'graph-check', {
+    allCardCount: canvasGraphCache.allById.size, filteredCardCount: cards.length,
+    inAllCards: canvasGraphCache.allById.has(state.inspectorCardId),
+    inGraph: state.canvasCardsById.has(state.inspectorCardId), collapsedCount: state.collapsedCardIds.size,
+  })
+  // #endregion debug-point graph-render
+  if (state.inspectorCardId !== null && !canvasGraphCache.allById.has(state.inspectorCardId)) {
+    // #region debug-point graph-render
+    if (inspectorDebug.enabled) inspectorDebug.log('B', 'renderCanvas:reset', 'graph-clears')
+    // #endregion debug-point graph-render
     state.inspectorCardId = null
     state.inspectorOpening = false
   }
@@ -1144,11 +1814,8 @@ function renderCanvas() {
     // center the focused card once the DOM is mounted (render tail).
     state.canvasNeedsCenter = true
   }
-  const visible = visibleCardIds(cards)
-  state.mountedCardIds = new Set(visible)
-  const mounted = cards.filter(card => visible.has(card.id))
-  const inspector = state.inspectorCardId === null ? '' : renderCardInspector(state.canvasCardsById.get(state.inspectorCardId))
-  return `<section class="canvas-view"><div class="canvas-viewport"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors">${canvasConnectors(cards)}</svg><div class="cards-layer">${mounted.map(card => conversationCard(card, graph)).join('')}${draftCard(cards)}</div></div></div>${inspector}</section>`
+  const inspector = state.inspectorCardId === null ? '' : renderCardInspector(canvasGraphCache.allById.get(state.inspectorCardId))
+  return `<section class="canvas-view" data-morph-key="canvas"><div class="canvas-viewport"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors" data-morph-key="links:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></svg><div class="cards-layer" data-morph-key="cards:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></div></div></div><div class="region-status" role="status" hidden><i aria-hidden="true"></i><span></span><button type="button" data-action="retry-bodies" hidden>重试</button></div>${inspector}</section>`
 }
 
 function isProcessMessage(message) {
@@ -1158,6 +1825,13 @@ function isProcessMessage(message) {
 
 function processSummary(text) {
   return text.replace(/\s+/g, ' ').trim().slice(0, 140) || '工具调用记录'
+}
+
+function bodyNotice(thread, message) {
+  if (bodyLoader.unavailable(thread.id, message.sourceSeq, bodyRevision(message))) return '<p class="body-notice">当前显示预览。<button type="button" data-action="retry-bodies">重新加载正文</button></p>'
+  if (message.previewOnly && !message.hydrated) return '<p class="body-notice">正在加载正文，当前显示预览。</p>'
+  if ((message.hydrated && message.truncated) || message.processTruncated || message.process?.length > 12) return '<p class="body-notice">内容较长，已显示部分正文或工具记录。请在 DSH 中查看完整内容。</p>'
+  return ''
 }
 
 function threadMessage(thread, message) {
@@ -1172,7 +1846,7 @@ function threadMessage(thread, message) {
   const fold = collapsible ? `<button class="message-fold" data-action="toggle-message" data-message="${escapeHtml(messageId)}" aria-label="${expanded ? '收起过程记录' : '展开过程记录'}" title="${expanded ? '收起' : '展开'}"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3.5 4.5 4.5L6 12.5"/></svg></button>` : ''
   const process = Array.isArray(message.process) && message.process.length > 0 ? message.process : null
   const body = message.pending && message.text === '' ? '<p class="message-streaming"><span class="streaming-dot"></span>正在回复</p>'
-    : `${collapsible && !expanded ? `<p class="message-summary">${escapeHtml(processSummary(message.text))}</p>` : renderMarkdown(message.text)}${message.pending ? '<p class="message-streaming"><span class="streaming-dot"></span>正在回复</p>' : ''}${process === null ? '' : processRecords(process, messageId)}`
+    : `${collapsible && !expanded ? `<p class="message-summary">${escapeHtml(processSummary(message.text))}</p>` : renderMarkdown(message.text, !message.pending)}${message.pending ? '<p class="message-streaming"><span class="streaming-dot"></span>正在回复</p>' : ''}${process === null ? '' : processRecords(process, messageId)}${bodyNotice(thread, message)}`
   const avatar = isUser ? '' : '<span class="message-avatar" aria-hidden="true"></span>'
   return `<article class="message message-${message.kind}${message.pending ? ' message-pending' : ''}${collapsible ? ' message-collapsible' : ''}${expanded ? ' expanded' : ''}" data-message-seq="${Number.isInteger(message.sourceSeq) ? message.sourceSeq : ''}"><header>${avatar}<span class="message-role">${label}</span><time>${formatTime(message.at)}</time>${branch}${fold}</header><div class="message-body">${body}</div></article>`
 }
@@ -1195,25 +1869,27 @@ function processState(entry) {
 function processRecords(process, messageId) {
   const key = `${messageId}:process`
   const expanded = state.expandedMessageIds.has(key)
-  const entries = process.map((entry, index) => {
+  const entries = expanded ? process.slice(0, 12).map((entry, index) => {
     const entryKey = `${key}:${index}`
     const entryExpanded = state.expandedMessageIds.has(entryKey)
     const state_ = processState(entry)
     const status = state_ === 'failed' ? '失败' : state_ === 'pending' ? '等待结果' : '完成'
     const statusClass = state_ === 'failed' ? ' process-status-error' : state_ === 'pending' ? ' process-status-pending' : ' process-status-done'
-    const argumentsHtml = typeof entry.arguments === 'string' && entry.arguments !== '' ? `<pre class="process-args">${escapeHtml(entry.arguments)}</pre>` : ''
-    const outcomeHtml = state_ === 'failed' && typeof entry.error === 'string' && entry.error !== ''
-      ? `<pre class="process-error">${escapeHtml(entry.error)}</pre>`
-      : typeof entry.result === 'string' && entry.result !== '' ? `<pre class="process-result">${escapeHtml(entry.result)}</pre>` : ''
-    return `<div class="process-entry${entryExpanded ? ' expanded' : ''}"><button class="process-entry-fold" data-action="toggle-message" data-message="${escapeHtml(entryKey)}"><span class="process-entry-name">${escapeHtml(entry.name)}</span><span class="process-status${statusClass}">${status}</span></button>${entryExpanded ? `<div class="process-entry-body">${argumentsHtml}${outcomeHtml}</div>` : ''}</div>`
-  }).join('')
+    const argumentsHtml = entryExpanded && typeof entry.arguments === 'string' && entry.arguments !== '' ? `<pre class="process-args">${escapeHtml(entry.arguments.slice(0, 8192))}</pre>` : ''
+    const outcomeHtml = !entryExpanded ? '' : state_ === 'failed' && typeof entry.error === 'string' && entry.error !== ''
+      ? `<pre class="process-error">${escapeHtml(entry.error.slice(0, 8192))}</pre>`
+      : typeof entry.result === 'string' && entry.result !== '' ? `<pre class="process-result">${escapeHtml(entry.result.slice(0, 8192))}</pre>` : ''
+    const truncated = entry.truncated || ['arguments', 'result', 'error'].some(field => typeof entry[field] === 'string' && entry[field].length > 8192)
+    return `<div class="process-entry${entryExpanded ? ' expanded' : ''}"><button class="process-entry-fold" data-action="toggle-message" data-message="${escapeHtml(entryKey)}"><span class="process-entry-name">${escapeHtml(entry.name)}</span><span class="process-status${statusClass}">${status}</span></button>${entryExpanded ? `<div class="process-entry-body">${argumentsHtml}${outcomeHtml}${truncated ? '<p class="body-notice">工具内容已截断，请在 DSH 中查看完整记录。</p>' : ''}</div>` : ''}</div>`
+  }).join('') : ''
   return `<section class="process-records${expanded ? ' expanded' : ''}"><button class="process-records-fold" data-action="toggle-message" data-message="${escapeHtml(key)}"><span>${expanded ? '收起过程记录' : '过程记录'}</span><span class="process-count">${process.length}</span></button>${expanded ? entries : ''}</section>`
 }
 
 function messagesForCard(card) {
-  const thread = state.workspace?.threads.find(item => item.id === card.dshThreadId)
+  const thread = canvasGraphCache?.threadById.get(card.dshThreadId) ?? state.workspace?.threads.find(item => item.id === card.dshThreadId)
   if (thread === undefined) return { thread: null, messages: [] }
-  const messages = messagesFor(thread)
+  if (card.turnMessages) return { thread, messages: card.turnMessages.map(message => hydratedMessage(thread, message)) }
+  const messages = messagesFor(thread, false)
   let turnIndex = -1
   let start = -1
   for (let index = 0; index < messages.length; index++) {
@@ -1226,14 +1902,15 @@ function messagesForCard(card) {
   }
   if (start === -1) return { thread, messages: [] }
   const end = messages.findIndex((message, index) => index > start && message.kind === 'user')
-  return { thread, messages: messages.slice(start, end === -1 ? undefined : end) }
+  return { thread, messages: messages.slice(start, end === -1 ? undefined : end).map(message => hydratedMessage(thread, message)) }
 }
 
 function inspectorProcessEntries(messages) {
   const entries = []
   for (const message of messages) {
+    if (entries.length >= 12) break
     if (Array.isArray(message.process)) {
-      entries.push(...message.process.map(entry => ({ ...entry })))
+      entries.push(...message.process.slice(0, 12 - entries.length).map(entry => ({ ...entry })))
       continue
     }
     if (message.kind === 'tool') {
@@ -1253,12 +1930,13 @@ function inspectorProcessEntries(messages) {
 
 function renderCardInspector(card) {
   if (card === undefined) return ''
+  card = hydratedCard(card)
   const { thread, messages } = messagesForCard(card)
   if (thread === null) return ''
-  const process = inspectorProcessEntries(messages)
+  const process = inspectorProcessEntries(messages).slice(0, 12)
   const answer = card.answer === null
     ? card.error === null ? '<p class="card-inspector-pending">等待助手回复</p>' : ''
-    : `<article class="card-inspector-answer">${renderMarkdown(card.answer.text)}${card.answer.pending ? '<p class="card-inspector-pending">正在回复</p>' : ''}</article>`
+    : `<article class="card-inspector-answer">${renderMarkdown(card.answer.text, !card.answer.pending)}${card.answer.pending ? '<p class="card-inspector-pending">正在回复</p>' : ''}</article>`
   const error = card.error === null ? '' : `<section class="card-inspector-error" role="alert"><strong>本轮未完成</strong><p>${escapeHtml(card.error.text)}</p></section>`
   const processRecordsHtml = process.length === 0 ? '' : processRecords(process, `${thread.id}:${card.id}:inspector`)
   const continueAction = card.canContinue === true ? `<button type="button" data-action="open-continue" data-thread="${thread.id}" data-card="${escapeHtml(card.id)}"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 3.5h11v7h-6l-3.5 2.5v-2.5h-1.5Z"/><path d="M8 5.5v3M6.5 7h3"/></svg>继续追问</button>` : ''
@@ -1266,19 +1944,50 @@ function renderCardInspector(card) {
     ? `<button type="button" data-action="open-branch" data-thread="${thread.id}" data-card="${escapeHtml(card.id)}" data-seq="${card.answer.sourceSeq}"><svg aria-hidden="true" viewBox="0 0 16 16"><circle cx="4" cy="3.5" r="1.5"/><circle cx="12" cy="3.5" r="1.5"/><circle cx="12" cy="12.5" r="1.5"/><path d="M5.5 3.5h2A2.5 2.5 0 0 1 10 6v5"/></svg>创建分支</button>`
     : ''
   const openDshAction = `<button class="primary" type="button" data-action="open-dsh" data-thread="${thread.id}" data-seq="${Number.isInteger(card.answer?.sourceSeq) ? card.answer.sourceSeq : ''}"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M7 3.5H4.5A1.5 1.5 0 0 0 3 5v6.5A1.5 1.5 0 0 0 4.5 13H11a1.5 1.5 0 0 0 1.5-1.5V9"/><path d="M9.5 3.5h3v3M12.4 3.6 7.5 8.5"/></svg>在 DSH 中打开</button>`
-  return `<aside class="card-inspector${state.inspectorOpening ? ' is-opening' : ''}" aria-label="卡片详情" data-inspector-card="${escapeHtml(card.id)}"><header class="card-inspector-head"><div><div class="card-inspector-meta"><span>第 ${card.turnIndex + 1} 轮</span>${card.error === null ? '' : '<span class="card-inspector-error-status">失败</span>'}${process.length > 0 ? `<span>工具 ${process.length}</span>` : ''}</div><h2 title="${escapeHtml(card.question)}">${escapeHtml(card.question)}</h2></div><button class="card-inspector-close" type="button" data-action="close-card-inspector" aria-label="关闭卡片详情" title="关闭"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m4.5 4.5 7 7m0-7-7 7"/></svg></button></header><div class="card-inspector-scroll">${error}${answer}${processRecordsHtml}</div><footer class="card-inspector-actions">${continueAction}${branch}${openDshAction}</footer></aside>`
+  const notices = messages.map(message => bodyNotice(thread, message)).filter(Boolean)
+  return `<aside class="card-inspector${state.inspectorOpening ? ' is-opening' : ''}" aria-label="卡片详情" data-inspector-card="${escapeHtml(card.id)}"><header class="card-inspector-head"><div><div class="card-inspector-meta"><span>第 ${card.turnIndex + 1} 轮</span>${card.error === null ? '' : '<span class="card-inspector-error-status">失败</span>'}${process.length > 0 ? `<span>工具 ${process.length}</span>` : ''}</div><h2 title="${escapeHtml(card.question)}">${escapeHtml(card.question)}</h2></div><button class="card-inspector-close" type="button" data-action="close-card-inspector" aria-label="关闭卡片详情" title="关闭"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m4.5 4.5 7 7m0-7-7 7"/></svg></button></header><div class="card-inspector-scroll">${error}${answer}${processRecordsHtml}${notices[0] ?? ''}</div><footer class="card-inspector-actions">${continueAction}${branch}${openDshAction}</footer></aside>`
+}
+
+function detailPage(thread) {
+  const all = messagesFor(thread, false)
+  const lastStart = Math.max(0, Math.floor((all.length - 1) / DETAIL_PAGE_MESSAGES) * DETAIL_PAGE_MESSAGES)
+  const target = state.detailTargetCardId
+  if (target?.startsWith(`${thread.id}:turn:`)) {
+    const seq = Number(target.slice(target.lastIndexOf(':') + 1))
+    const index = all.findIndex(message => message.sourceSeq === seq)
+    if (index !== -1) state.detailPageByThread.set(thread.id, Math.floor(index / DETAIL_PAGE_MESSAGES) * DETAIL_PAGE_MESSAGES)
+  }
+  const saved = state.detailPageByThread.get(thread.id)
+  const start = saved === null || saved === undefined ? lastStart : Math.min(saved, lastStart)
+  return { messages: all.slice(start, start + DETAIL_PAGE_MESSAGES).map(message => hydratedMessage(thread, message)), start, total: all.length, lastStart }
+}
+
+function changeDetailPage(thread, direction) {
+  const page = detailPage(thread)
+  const start = Math.max(0, Math.min(page.lastStart, page.start + direction * DETAIL_PAGE_MESSAGES))
+  state.detailPageByThread.set(thread.id, start === page.lastStart ? null : start)
+  state.detailTargetCardId = null
+  state.detailScrollByThread.set(thread.id, 0)
+  state.detailThreadId = null
+  render()
 }
 
 function renderThread() {
   const thread = currentThread()
   if (thread === null) return renderCanvas()
-  const messages = messagesFor(thread)
+  const page = detailPage(thread)
+  const messages = page.messages
   const waiting = state.pendingReplies.has(thread.dshSessionId)
   const latestAssistantSeq = [...messages].reverse().find(message => Number.isInteger(message.sourceSeq))?.sourceSeq
-  return `<section class="detail-view"><header class="detail-head"><div class="detail-head-title"><div class="detail-head-meta"><span class="detail-badge">${thread.parentId === null ? '会话' : '分支'}</span>${thread.dshSessionTitle ?? thread.title ? `<span class="detail-subtitle">${escapeHtml(thread.dshSessionTitle ?? thread.title)}</span>` : ''}</div><h1>${escapeHtml(questionFor(thread))}</h1></div><div class="detail-head-actions"><button data-action="open-dsh" data-thread="${thread.id}" data-seq="${Number.isInteger(latestAssistantSeq) ? latestAssistantSeq : ''}" title="在原生对话中打开此会话">在 DSH 中打开</button><button data-action="open-branch" data-thread="${thread.id}" title="基于最新回答创建分支">创建分支</button><button class="primary" data-action="show-canvas">返回画布</button></div></header><div class="detail-scroll">${messages.map(message => threadMessage(thread, message)).join('') || '<div class="note-empty">等待这条会话的第一条消息。</div>'}</div><form class="message-composer" data-compose="${thread.id}"><textarea maxlength="4000" placeholder="继续当前会话…" ${waiting ? 'disabled' : ''}></textarea><button class="primary" type="submit" ${waiting ? 'disabled' : ''}>${waiting ? '等待回复' : '发送'}</button></form></section>`
+  const pager = `<nav class="detail-pages" aria-label="会话历史翻页"><button data-action="detail-prev" data-thread="${thread.id}" ${page.start === 0 ? 'disabled' : ''}>上一页</button><span>${page.total === 0 ? '暂无消息' : `${page.start + 1}–${page.start + messages.length} / ${page.total} 条消息`}</span><button data-action="detail-next" data-thread="${thread.id}" ${page.start >= page.lastStart ? 'disabled' : ''}>下一页</button></nav>`
+  return `<section class="detail-view"><header class="detail-head"><div class="detail-head-title"><div class="detail-head-meta"><span class="detail-badge">${thread.parentId === null ? '会话' : '分支'}</span>${thread.dshSessionTitle ?? thread.title ? `<span class="detail-subtitle">${escapeHtml(thread.dshSessionTitle ?? thread.title)}</span>` : ''}</div><h1>${escapeHtml(questionFor(thread))}</h1></div><div class="detail-head-actions"><button data-action="open-dsh" data-thread="${thread.id}" data-seq="${Number.isInteger(latestAssistantSeq) ? latestAssistantSeq : ''}" title="在原生对话中打开此会话">在 DSH 中打开</button><button data-action="open-branch" data-thread="${thread.id}" title="基于最新回答创建分支">创建分支</button><button class="primary" data-action="show-canvas">返回画布</button></div></header>${pager}<div class="detail-scroll">${messages.map(message => threadMessage(thread, message)).join('') || '<div class="note-empty">等待这条会话的第一条消息。</div>'}</div><form class="message-composer" data-compose="${thread.id}"><textarea maxlength="4000" placeholder="继续当前会话…" ${waiting ? 'disabled' : ''}></textarea><button class="primary" type="submit" ${waiting ? 'disabled' : ''}>${waiting ? '等待回复' : '发送'}</button></form></section>`
 }
 
 function render() {
+  if (!state.mapVisible || document.hidden) return
+  // #region debug-point graph-render
+  if (inspectorDebug.enabled) inspectorDebug.log('B-D', 'render:begin', 'render-before')
+  // #endregion debug-point graph-render
   // Remember the departing thread's scroll position per thread id, so
   // switching sessions restores each conversation's own place instead of
   // smearing one session's position onto another.
@@ -1314,8 +2023,16 @@ function render() {
   const detailAvailable = currentThread() !== null
   const canvasTabs = `<nav class="canvas-tabs" aria-label="会话地图视图"><button class="${state.mode === 'canvas' ? 'active' : ''}" data-action="show-canvas">地图</button><button class="${state.mode === 'thread' ? 'active' : ''}" data-action="show-thread" data-thread="${state.activeId ?? ''}" ${detailAvailable ? '' : 'disabled'}>详情</button></nav>`
   morphInto(app, `<main class="synapse-shell ${state.sidebarCollapsed ? 'sidebar-collapsed' : ''}"><aside class="sidebar"><div class="sidebar-brand-row"><div class="brand" aria-label="Synapse"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 32 32" fill="none"><path d="M9 10.5 16 7l7 3.5M9 10.5v8L16 22m0-15v15m7-11.5v8L16 22"/><circle cx="9" cy="10" r="2.5"/><circle cx="23" cy="10" r="2.5"/><circle cx="16" cy="23" r="2.5"/></svg><strong>Synapse</strong></div><button class="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-label="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}" title="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.25"/><path d="M6 2v12"/></svg></button></div><button class="new-workspace" type="button" data-action="create-session" ${state.draft !== null ? 'disabled' : ''}><svg class="new-session-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v6.5M4.75 8h6.5"/></svg><span>新会话</span></button><label class="workspace-label"><span>工作区</span><span class="workspace-select"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 4.75h3l1.2 1.5h6.8v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"/></svg><select data-action="select-workspace" aria-label="选择工作区" ${state.draft !== null ? 'disabled' : ''}>${choices.map(item => `<option value="${item.id}" title="${escapeHtml(item.path ?? item.title)}" ${item.id === selectedWorkspaceId ? 'selected' : ''}>${escapeHtml(item.title)}</option>`).join('')}</select></span></label><div class="sidebar-heading"><span>会话</span></div><nav class="thread-tree">${threads.map(thread => `<button class="tree-row ${thread.id === state.activeId ? 'active' : ''}" data-action="select-thread" data-thread="${thread.id}" style="--thread-color:#374151"><span class="tree-dot"></span><span>${escapeHtml(threadListTitle(thread))}</span>${thread.parentId === null ? '' : '<i>分支</i>'}</button>`).join('') || '<p class="tree-empty">暂未同步会话</p>'}</nav></aside><header class="topbar">${canvasControls}</header><section class="main-stage">${state.error ? `<div class="status-message" role="alert"><span>${escapeHtml(state.error)}</span><button data-action="dismiss-error" aria-label="关闭" title="关闭">×</button></div>` : ''}${canvasTabs}${view}${selectionFollowupButton()}</section></main>`)
+  if (state.mode === 'canvas' && document.querySelector('.cards-layer')) {
+    syncCanvasDraft()
+    syncCanvasViewport({ immediate: true })
+  } else {
+    cancelRegionWork()
+    regionView = null
+    regionElements.clear()
+    state.mountedCardIds.clear()
+  }
   installDragging()
-  cacheCardConnectors()
   // The initial camera from renderCanvas is inset (viewport not laid out yet);
   // center it on the focused card once the canvas DOM is mounted.
   if (state.canvasNeedsCenter) {
@@ -1353,7 +2070,10 @@ function render() {
   }
   // Card faces and the detail view only hold previews: pull the real bodies for
   // whatever is on screen right now (issue #42).
-  void hydrateBodies()
+  // #region debug-point graph-render
+  if (inspectorDebug.enabled) inspectorDebug.log('B-D', 'render:end', 'render-after')
+  // #endregion debug-point graph-render
+  if (state.mode !== 'canvas') hydrateBodies()
 }
 
 /**
@@ -1361,64 +2081,79 @@ function render() {
  * workspace payload carries previews only, so each newly mounted card and each
  * opened detail view hydrates from the DSH session log.
  */
-async function hydrateBodies() {
-  const wanted = new Map()
-  const add = (threadId, message) => {
+function hydrateBodies() {
+  if (!state.mapVisible || document.hidden || state.workspaceLoadBusy) {
+    // #region debug-point body-update
+    if (inspectorDebug.enabled) inspectorDebug.log('D', 'hydrateBodies:pause', 'body-paused')
+    // #endregion debug-point body-update
+    bodyLoader.pause(); return
+  }
+  const wanted = []
+  const add = (threadId, message, priority = 1) => {
     if (threadId === undefined || message === null || message === undefined) return
     if (!Number.isInteger(message.sourceSeq)) return
-    if (state.bodies.get(threadId)?.has(message.sourceSeq) === true) return
-    const key = `${threadId}:${message.sourceSeq}`
-    if (state.bodyRequests.has(key) || state.bodyFailures.has(key)) return
-    const seqs = wanted.get(threadId) ?? new Set()
-    seqs.add(message.sourceSeq)
-    wanted.set(threadId, seqs)
+    wanted.push({ threadId, seq: message.sourceSeq, revision: bodyRevision(message), priority })
   }
-  const addCard = card => {
+  const addCard = (card, priority = 1) => {
     if (card === undefined) return
-    add(card.dshThreadId, card.questionMessage)
-    add(card.dshThreadId, card.answer)
-    add(card.dshThreadId, card.error)
+    add(card.dshThreadId, card.questionMessage, priority)
+    add(card.dshThreadId, card.answer, priority)
+    add(card.dshThreadId, card.error, priority)
   }
+  // An inspector wins admission when an unusually large canvas viewport
+  // contains more than the bounded wanted-message set.
+  if (state.mode === 'canvas' && state.inspectorCardId !== null) addCard(canvasGraphCache?.allById.get(state.inspectorCardId), 0)
   if (state.mode === 'thread' && state.activeId !== null) {
     const thread = currentThread()
-    if (thread !== null && !state.bodiesLoaded.has(thread.id)) {
-      for (const message of persistedMessagesFor(thread)) add(thread.id, message)
+    if (thread !== null) {
+      for (const message of detailPage(thread).messages) add(thread.id, message)
     }
-  } else if (state.mode === 'canvas') {
-    for (const cardId of state.mountedCardIds) addCard(state.canvasCardsById?.get(cardId))
+  } else if (state.mode === 'canvas' && regionView && !regionView.overview) {
+    for (const card of regionView.cards) addCard(card)
+    for (const card of regionView.prefetch) addCard(card, 2)
   }
-  if (state.inspectorCardId !== null) addCard(state.canvasCardsById?.get(state.inspectorCardId))
-  for (const [threadId, seqs] of wanted) void fetchBodies(threadId, [...seqs])
+  const viewKey = state.mode === 'thread'
+    ? `thread:${state.activeId}:${currentThread() === null ? 0 : detailPage(currentThread()).start}`
+    : `canvas:${state.inspectorCardId ?? ''}`
+  // #region debug-point body-update
+  if (inspectorDebug.enabled && state.inspectorCardId !== null) inspectorDebug.log('D', 'hydrateBodies:sync', 'body-wanted', {
+    viewKey, wantedCount: wanted.length, priorityMessages: wanted.slice(0, 3).map(item => [item.threadId, item.seq]),
+  })
+  // #endregion debug-point body-update
+  bodyLoader.sync(wanted, viewKey)
 }
 
-async function fetchBodies(threadId, seqs) {
-  if (seqs.length === 0) return
-  const keys = seqs.map(seq => `${threadId}:${seq}`)
-  for (const key of keys) state.bodyRequests.add(key)
-  try {
-    const body = await api(`/synapse/api/threads/${threadId}/full?seqs=${seqs.join(',')}`)
-    const cached = state.bodies.get(threadId) ?? new Map()
-    for (const [seq, payload] of Object.entries(body.messages ?? {})) {
-      if (payload === null || typeof payload !== 'object') continue
-      cached.set(Number(seq), payload)
-    }
-    state.bodies.set(threadId, cached)
-    if (state.mode === 'thread' && state.activeId === threadId) state.bodiesLoaded.add(threadId)
-    if (body.unavailable === true) {
-      // Archived or already removed from DSH: keep the previews, stop asking.
-      for (const message of persistedMessagesFor(currentThread() ?? { messages: [] })) {
-        if (Number.isInteger(message.sourceSeq)) state.bodyFailures.add(`${threadId}:${message.sourceSeq}`)
-      }
-      state.bodiesLoaded.add(threadId)
-    }
-    if (state.mode === 'thread' || state.inspectorCardId !== null) render()
-    else if (canReplaceView()) render()
-    else deferCanvasRefresh(400)
-  } catch {
-    for (const key of keys) state.bodyFailures.add(key)
-  } finally {
-    for (const key of keys) state.bodyRequests.delete(key)
+function refreshLoadedBodies(entries = []) {
+  const inspectorCard = canvasGraphCache?.allById.get(state.inspectorCardId)
+  let inspectorChanged = false
+  for (const entry of entries) {
+    const id = canvasGraphCache?.byMessage.get(`${entry.threadId}:${entry.seq}`)
+    if (id && regionElements.has(id)) regionDirtyCards.add(id)
+    if (inspectorCard?.dshThreadId === entry.threadId
+      && [inspectorCard.questionMessage, inspectorCard.answer, inspectorCard.error].some(message => message?.sourceSeq === entry.seq)) inspectorChanged = true
   }
+  if (inspectorChanged && inspectorBodyTimer === 0) {
+    inspectorBodyTimer = window.setTimeout(() => { inspectorBodyTimer = 0; refreshCardInspector() }, 100)
+  }
+  if (regionDirtyCards.size > 0) syncCanvasViewport()
+  updateRegionStatus()
+}
+
+function refreshCardInspector() {
+  if (!state.mapVisible || document.hidden || state.mode !== 'canvas' || state.inspectorCardId === null) return
+  const inspector = document.querySelector('.card-inspector')
+  // Loading must not undo a user's in-progress close animation.
+  if (!(inspector instanceof HTMLElement) || inspector.classList.contains('is-closing')) return
+  if (state.dragging || state.canvasGesture) {
+    if (inspectorBodyTimer === 0) inspectorBodyTimer = window.setTimeout(() => { inspectorBodyTimer = 0; refreshCardInspector() }, 100)
+    return
+  }
+  const card = canvasGraphCache?.allById.get(state.inspectorCardId)
+  if (!card) return
+  const scroll = inspector.querySelector('.card-inspector-scroll')?.scrollTop ?? 0
+  const next = patchElementHtml(inspector, renderCardInspector(card))
+  const body = next.querySelector('.card-inspector-scroll')
+  if (body) body.scrollTop = scroll
 }
 
 function renderPreservingDetailScroll() {
@@ -1427,6 +2162,9 @@ function renderPreservingDetailScroll() {
 
 let inspectorCloseTimer = 0
 function openCardInspector(cardId) {
+  // #region debug-point inspector-selection
+  if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'openCardInspector', 'inspector-open', { nextCardId: cardId, cancelledCloseTimer: inspectorCloseTimer !== 0 })
+  // #endregion debug-point inspector-selection
   if (inspectorCloseTimer !== 0) {
     window.clearTimeout(inspectorCloseTimer)
     inspectorCloseTimer = 0
@@ -1437,6 +2175,9 @@ function openCardInspector(cardId) {
 
 function closeCardInspector({ animate = true } = {}) {
   if (state.inspectorCardId === null) return
+  // #region debug-point inspector-selection
+  if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'closeCardInspector', 'inspector-close', { animate })
+  // #endregion debug-point inspector-selection
   if (inspectorCloseTimer !== 0) window.clearTimeout(inspectorCloseTimer)
   const cardId = state.inspectorCardId
   const inspector = document.querySelector('.card-inspector')
@@ -1450,6 +2191,9 @@ function closeCardInspector({ animate = true } = {}) {
   inspectorCloseTimer = window.setTimeout(() => {
     inspectorCloseTimer = 0
     if (state.inspectorCardId !== cardId) return
+    // #region debug-point inspector-selection
+    if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'closeCardInspector:timer', 'close-timer')
+    // #endregion debug-point inspector-selection
     state.inspectorCardId = null
     state.inspectorOpening = false
     render()
@@ -1469,13 +2213,13 @@ function applyCanvasTransform() {
 // new markup into the live tree instead: matching nodes are patched in place and
 // whatever sits under the pointer stays alive.
 
-const MORPH_KEY_ATTRIBUTES = ['data-morph-key', 'data-card-id', 'data-thread', 'id']
+const MORPH_KEY_ATTRIBUTES = ['data-morph-key', 'data-card-id', 'data-inspector-card', 'data-thread', 'id']
 
 function morphKeyOf(node) {
   if (!(node instanceof Element)) return null
   for (const attribute of MORPH_KEY_ATTRIBUTES) {
     const value = node.getAttribute(attribute)
-    if (value !== null && value !== '') return `${node.tagName}|${attribute}|${value}`
+    if (value !== null && value !== '') return `${node.tagName}|${attribute}|${value}|${node.getAttribute('data-action') ?? ''}`
   }
   return null
 }
@@ -1502,6 +2246,9 @@ function morphKeepsChildren(node) {
   if (!(node instanceof Element)) return false
   if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) return true
   if (node.isContentEditable === true) return true
+  // Regional layers own their incremental DOM. Shell/inspector changes must
+  // not recreate every mounted card or discard the region queue.
+  if (node.hasAttribute('data-region-layer')) return true
   return node === morphFrozenRoot
 }
 
@@ -1539,13 +2286,16 @@ function morphChildren(from, to) {
   const keyed = new Map()
   for (const child of [...from.childNodes]) {
     const key = morphKeyOf(child)
-    if (key !== null && !keyed.has(key)) keyed.set(key, child)
+    if (key !== null) {
+      if (!keyed.has(key)) keyed.set(key, [])
+      keyed.get(key).push(child)
+    }
   }
   const matched = new Set()
   let cursor = from.firstChild
   for (const next of [...to.childNodes]) {
     const key = morphKeyOf(next)
-    let match = key === null ? null : keyed.get(key) ?? null
+    let match = key === null ? null : keyed.get(key)?.shift() ?? null
     if (match === null && cursor !== null && morphKeyOf(cursor) === null) match = cursor
     if (match === null) {
       const inserted = next.cloneNode(true)
@@ -1577,10 +2327,11 @@ function morphInto(container, html) {
   }
 }
 
+const boundDragHandles = new WeakSet()
 function bindDragHandle(handle) {
   // Cards now survive a render, so bind each drag handle once.
-  if (handle.dataset.dragBound === '1') return
-  handle.dataset.dragBound = '1'
+  if (boundDragHandles.has(handle)) return
+  boundDragHandles.add(handle)
   handle.addEventListener('pointerdown', event => {
     const cardId = event.currentTarget.dataset.dragCard
     const card = event.currentTarget.closest('.thread-card')
@@ -1619,8 +2370,15 @@ function bindDragHandle(handle) {
       if (frame !== 0) { window.cancelAnimationFrame(frame); frame = 0 }
       apply()
       rememberCardPosition(cardId, position, aliases)
+      const dataCard = state.canvasCardsById?.get(cardId)
+      if (dataCard) {
+        dataCard.positionLocked = true
+        canvasGraphCache?.index.set(dataCard)
+      }
+      if (regionView) regionView.planKey = null
       state.dragging = false
       deferCanvasRefresh(120)
+      syncCanvasViewport({ immediate: true })
       // No full render: only the dragged card's inline position and its
       // connectors changed; rebuilding the whole canvas on drop is the jank.
     }
@@ -1779,6 +2537,7 @@ app.addEventListener('pointerdown', event => {
     apply()
     state.canvasGesture = false
     deferCanvasRefresh(120)
+    syncCanvasViewport({ immediate: true })
   }
   document.addEventListener('pointermove', move)
   document.addEventListener('pointerup', stop)
@@ -1840,6 +2599,12 @@ app.addEventListener('click', async event => {
     if (thread === undefined) return
     const cardId = card.dataset.cardId
     if (cardId === undefined) return
+    // #region debug-point inspector-selection
+    if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'click:card', 'card-click', {
+      clickedCardId: cardId, clickedThreadId: thread.id, clickedSessionId: thread.dshSessionId,
+      currentSessionId: state.currentDsh?.id ?? null,
+    })
+    // #endregion debug-point inspector-selection
     state.activeId = thread.id
     state.selectedCardId = cardId
     openCardInspector(cardId)
@@ -1855,6 +2620,9 @@ app.addEventListener('click', async event => {
     return
   }
   const thread = state.workspace?.threads.find(item => item.id === button.dataset.thread)
+  // #region debug-point inspector-selection
+  if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'click:button', 'button-click', { action: button.dataset.action, threadId: thread?.id ?? null, cardId: button.dataset.card ?? null })
+  // #endregion debug-point inspector-selection
   try {
     if (button.dataset.action === 'follow-selection') {
       const followup = selectionFollowup
@@ -1883,6 +2651,12 @@ app.addEventListener('click', async event => {
     }
     if (button.dataset.action === 'close') post('synapse:close')
     if (button.dataset.action === 'close-card-inspector') { closeCardInspector(); return }
+    if (button.dataset.action === 'retry-bodies') {
+      bodyLoader.retry()
+      refreshCardInspector()
+      updateRegionStatus()
+      return
+    }
     if (button.dataset.action === 'toggle-sidebar') { state.sidebarCollapsed = !state.sidebarCollapsed; render() }
     if (button.dataset.action === 'create-session') openNewSession()
     if (button.dataset.action === 'open-current' && state.currentDsh !== null) post('synapse:open-session', { sessionId: state.currentDsh.id })
@@ -1904,6 +2678,8 @@ app.addEventListener('click', async event => {
       // without closing the map; the client confirms via synapse:current-session.
       if (thread.dshSessionId !== null) post('synapse:activate-session', { sessionId: thread.dshSessionId })
     }
+    if (button.dataset.action === 'detail-prev' && thread !== undefined) changeDetailPage(thread, -1)
+    if (button.dataset.action === 'detail-next' && thread !== undefined) changeDetailPage(thread, 1)
     if (button.dataset.action === 'show-thread' && thread !== undefined) { state.activeId = thread.id; state.mode = 'thread'; state.detailTargetCardId = button.dataset.card ?? null; render(); void loadThreadHistory(thread) }
     if (button.dataset.action === 'show-canvas') { state.mode = 'canvas'; render() }
     if (button.dataset.action === 'toggle-card-children' && button.dataset.card !== undefined) {
@@ -1961,6 +2737,9 @@ app.addEventListener('change', event => {
   const select = event.target.closest('[data-action="select-workspace"]')
   if (!(select instanceof HTMLSelectElement)) return
   const choice = workspaceChoices().find(item => item.id === select.value)
+  // #region debug-point workspace-caches
+  if (inspectorDebug.enabled) inspectorDebug.log('C', 'change:workspace', 'workspace-input', { nextWorkspaceId: choice?.id ?? null })
+  // #endregion debug-point workspace-caches
   state.inspectorCardId = null
   state.inspectorOpening = false
   if (choice?.source === 'dsh') {
@@ -1994,7 +2773,11 @@ app.addEventListener('submit', event => {
 window.addEventListener('message', event => {
   if (event.origin !== window.location.origin || event.data?.source !== 'dsh-synapse') return
   const data = event.data
+  // #region debug-point visibility
+  if (inspectorDebug.enabled && ['synapse:map-opened', 'synapse:map-closed', 'synapse:map-visible'].includes(data.type)) inspectorDebug.log('D', 'message:map', 'map-visibility', { type: data.type })
+  // #endregion debug-point visibility
   if (data.type === 'synapse:map-opened') {
+    state.mapVisible = true
     // Do NOT reset the camera here: toggling dialog<->map for the same
     // session must keep the user's viewport. A fresh canvas (canvasView
     // not initialized) still centers via renderCanvas; a real session switch
@@ -2003,6 +2786,8 @@ window.addEventListener('message', event => {
     render()
     window.requestAnimationFrame(() => post('synapse:map-ready'))
   }
+  if (data.type === 'synapse:map-closed') pauseMapBodies()
+  if (data.type === 'synapse:map-visible') { state.mapVisible = true; render() }
   if (data.type === 'synapse:theme') {
     document.documentElement.dataset.theme = data.dark === true ? 'dark' : 'light'
   }
@@ -2020,6 +2805,7 @@ window.addEventListener('message', event => {
     state.workspacesSignature = signature
     state.dshWorkspaces = nextWorkspaces
     state.archivedSessionIds = nextArchived
+    pruneWorkspaceCaches()
     const current = currentDshWorkspace()
     if (current !== undefined && current.id !== state.selectedDshWorkspaceId) void openDshWorkspace(current.id).catch(setError)
     else if (state.selectedDshWorkspaceId !== null) void openDshWorkspace(state.selectedDshWorkspaceId).catch(setError)
@@ -2032,10 +2818,23 @@ window.addEventListener('message', event => {
     const nextSignature = sessionSignature(data.session)
     const preserveCanvasCamera = previousId !== data.session?.id && state.mapCardSessionSwitches.delete(data.session?.id)
     const thread = currentDshThread()
-    if (thread !== undefined) {
+    // #region debug-point host-session
+    if (inspectorDebug.enabled) inspectorDebug.log('A', 'message:current-session', 'session-sync', {
+      previousSessionId: previousId ?? null, incomingSessionId: data.session?.id ?? null,
+      incomingThreadId: thread?.id ?? null, preserveSelectedCard: thread !== undefined && state.activeId === thread.id,
+      preserveCanvasCamera, sessionChanged: previousId !== data.session?.id,
+    })
+    if (inspectorDebug.enabled && previousId === data.session?.id && thread?.id !== state.activeId) inspectorDebug.log('A', 'message:current-session:status', 'session-status-only')
+    // #endregion debug-point host-session
+    // A status update for the old host session can arrive while a map click is
+    // opening another session. Only actual navigation reconciles selection.
+    if (thread !== undefined && previousId !== data.session?.id) {
       const preserveSelectedCard = state.activeId === thread.id
       state.activeId = thread.id
       if (!preserveSelectedCard) {
+        // #region debug-point host-session
+        if (inspectorDebug.enabled) inspectorDebug.log('A', 'message:current-session:reset', 'session-clears', { incomingThreadId: thread.id })
+        // #endregion debug-point host-session
         state.selectedCardId = null
         state.inspectorCardId = null
         state.inspectorOpening = false
@@ -2061,7 +2860,7 @@ window.addEventListener('message', event => {
   if (data.type === 'synapse:live-reply' && typeof data.sessionId === 'string') {
     const thread = state.workspace?.threads.find(item => item.dshSessionId === data.sessionId)
     if (thread !== undefined) {
-      if (data.running === true) {
+      if (data.running === true && state.mapVisible && !document.hidden) {
         state.liveReplies.set(data.sessionId, { running: true, text: typeof data.text === 'string' ? data.text : '' })
         // Streaming: patch the live card's answer in place instead of
         // rebuilding the whole canvas on every chunk; a full render reconciles
@@ -2071,6 +2870,7 @@ window.addEventListener('message', event => {
         else if (canReplaceView()) scheduleLiveRender()
       } else {
         state.liveReplies.delete(data.sessionId)
+        invalidateCanvasGraph()
         if (canReplaceView() || state.pendingReplies.has(data.sessionId)) renderPreservingDetailScroll()
       }
     }
@@ -2081,8 +2881,22 @@ window.addEventListener('message', event => {
 })
 
 post('synapse:request-current')
-refreshSummaries().catch(setError)
+document.addEventListener('visibilitychange', () => {
+  // #region debug-point visibility
+  if (inspectorDebug.enabled) inspectorDebug.log('D', 'visibilitychange', 'page-visibility')
+  // #endregion debug-point visibility
+  if (document.hidden) { clearViewCaches(); state.liveReplies.clear(); hideSelectionFollowup(); releaseRenderedBodies() }
+  else if (state.mapVisible) { post('synapse:request-current'); render() }
+})
+window.addEventListener('pagehide', pauseMapBodies)
+window.addEventListener('pageshow', event => {
+  if (event.persisted && window.parent === window) { state.mapVisible = true; render() }
+})
 let polling = false
+let projectionPollFailures = 0
+let projectionPollAfter = 0
+let projectionPollWorkspaceId = null
+let projectionPollError = ''
 let liveRenderTimer = 0
 let liveCardFrame = 0
 let liveCardSessionId = null
@@ -2107,17 +2921,18 @@ function applyLiveReplyToCard(sessionId) {
   if (thread === undefined) return
   const live = state.liveReplies.get(sessionId)
   if (live?.running !== true) return
-  const cards = app.querySelectorAll(`.thread-card[data-thread="${CSS.escape(thread.id)}"]`)
-  const card = cards[cards.length - 1]
-  if (!(card instanceof HTMLElement)) return
-  const answer = card.querySelector('.thread-answer')
-  if (!(answer instanceof HTMLElement)) return
-  const text = live.text
-  // Morph instead of replacing the subtree: the answer keeps its nodes, so a
-  // pointer that went down inside it still resolves to a click on release.
-  morphInto(answer, text.trim() === ''
-    ? '<p class="thread-answer-pending">正在回复</p>'
-    : `${renderMarkdown(text)}<p class="thread-answer-pending">正在回复</p>`)
+  const dataCard = canvasGraphCache?.latestByThread.get(thread.id)
+  if (!dataCard || dataCard.answer !== null && !dataCard.answer.pending) return
+  dataCard.answer = { kind: 'assistant', text: live.text, pending: true }
+  if (dataCard.id === state.inspectorCardId && inspectorBodyTimer === 0) {
+    inspectorBodyTimer = window.setTimeout(() => { inspectorBodyTimer = 0; refreshCardInspector() }, 100)
+  }
+  // Overview cards use previews and never parse a full streamed response.
+  if (regionView?.overview) return
+  if (regionElements.has(dataCard.id)) {
+    regionDirtyCards.add(dataCard.id)
+    syncCanvasViewport()
+  }
 }
 function scheduleLiveRender() {
   if (liveRenderTimer !== 0 || !canReplaceView()) return
@@ -2127,10 +2942,42 @@ function scheduleLiveRender() {
   }, 120)
 }
 async function pollProjection() {
-  if (polling || document.hidden || !canReplaceView()) return
+  if (polling || !state.mapVisible || document.hidden || state.workspaceLoadBusy || !canReplaceView()) return
+  const targetWorkspaceId = () => state.selectedDshWorkspaceId ?? currentDshWorkspace()?.id ?? state.workspace?.id ?? state.dshWorkspaces[0]?.id ?? null
+  const workspaceId = targetWorkspaceId()
+  if (workspaceId !== projectionPollWorkspaceId) {
+    projectionPollWorkspaceId = workspaceId
+    projectionPollFailures = 0
+    projectionPollAfter = 0
+  }
+  if (Date.now() < projectionPollAfter) return
   polling = true
   try {
     await refreshProjection()
+    projectionPollFailures = 0
+    projectionPollAfter = 0
+    if (projectionPollError !== '' && state.error === projectionPollError) {
+      state.error = ''
+      if (canReplaceView()) render()
+    }
+    projectionPollError = ''
+  } catch (error) {
+    projectionPollFailures += 1
+    projectionPollAfter = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(projectionPollFailures, 5))
+    // An old workspace request cannot put an error over a newer user choice.
+    if (workspaceId === targetWorkspaceId()) {
+      const message = `自动刷新失败：${error instanceof Error ? error.message : String(error)}`
+      if (projectionPollError !== message) {
+        const mayShowError = state.error === '' || state.error === projectionPollError
+        projectionPollError = message
+        if (mayShowError) {
+          state.error = message
+          if (canReplaceView()) render()
+        }
+      }
+    }
   } finally { polling = false }
 }
+void pollProjection()
 window.setInterval(() => { void pollProjection() }, 1_000)
+window.addEventListener('resize', () => syncCanvasViewport({ immediate: true }))

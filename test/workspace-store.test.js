@@ -216,7 +216,7 @@ test('skips the harness skill catalogue instead of projecting it as a question',
   assert.equal(thread.title, '现在这个插件是 0.4.2 还是 0.4.1')
 })
 
-test('drops a stored skill catalogue card on load and rewrites the file', async () => {
+test('drops a stored skill catalogue on load only when its provenance confirms injection', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-catalog-prune-'))
   const dataFile = join(directory, 'state.json')
   const at = '2026-01-01T00:00:00.000Z'
@@ -230,7 +230,7 @@ test('drops a stored skill catalogue card on load and rewrites the file', async 
         color: '#0f766e', position: { x: 86, y: 82 }, sourceSeedLength: null, createdAt: at, updatedAt: at,
         messages: [
           { id: 'm-1', kind: 'user', text: '真实提问', sourceSeq: 1, at, process: [] },
-          { id: 'm-2', kind: 'user', text: '<system-reminder>\nA skill is a reusable set.<available_skills>- `x`</available_skills>', sourceSeq: 2, at, process: [] },
+          { id: 'm-2', kind: 'user', sourceKind: 'skill-catalog', text: '<system-reminder>\nA skill is a reusable set.<available_skills>- `x`</available_skills>', sourceSeq: 2, at, process: [] },
           { id: 'm-3', kind: 'assistant', text: '回答', sourceSeq: 3, at, process: [] },
         ],
       }],

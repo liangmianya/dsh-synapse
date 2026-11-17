@@ -117,7 +117,7 @@ window.__ModuleLoader__.load({
       document.head.append(style)
       const host = document.createElement('div')
       host.className = 'dsh-synapse-host'
-      host.innerHTML = '<div class="dsh-synapse-switch" role="group" aria-label="视图切换"><span class="dsh-synapse-grip" role="button" tabindex="0" aria-label="拖动位置" title="拖动位置（双击复位，方向键微调）"><svg aria-hidden="true" viewBox="0 0 8 14"><circle cx="2" cy="2" r="1.3"/><circle cx="6" cy="2" r="1.3"/><circle cx="2" cy="7" r="1.3"/><circle cx="6" cy="7" r="1.3"/><circle cx="2" cy="12" r="1.3"/><circle cx="6" cy="12" r="1.3"/></svg></span><button type="button" data-view="dialog" class="active" aria-pressed="true">对话</button><button type="button" data-view="map" aria-pressed="false">会话地图</button></div><section class="dsh-synapse-overlay" hidden><iframe title="会话地图" src="/synapse/"></iframe></section>'
+      host.innerHTML = '<div class="dsh-synapse-switch" role="group" aria-label="视图切换"><span class="dsh-synapse-grip" role="button" tabindex="0" aria-label="拖动位置" title="拖动位置（双击复位，方向键微调）"><svg aria-hidden="true" viewBox="0 0 8 14"><circle cx="2" cy="2" r="1.3"/><circle cx="6" cy="2" r="1.3"/><circle cx="2" cy="7" r="1.3"/><circle cx="6" cy="7" r="1.3"/><circle cx="2" cy="12" r="1.3"/><circle cx="6" cy="12" r="1.3"/></svg></span><button type="button" data-view="dialog" class="active" aria-pressed="true">对话</button><button type="button" data-view="map" aria-pressed="false">会话地图</button></div><section class="dsh-synapse-overlay" hidden><iframe title="会话地图" src="synapse/"></iframe></section>'
       document.body.append(host)
       const switchEl = host.querySelector('.dsh-synapse-switch')
       // Two live instances (a bundle loaded twice, or a sibling that outlived a
@@ -228,6 +228,7 @@ window.__ModuleLoader__.load({
         overlay.classList.remove('is-opening')
         overlay.hidden = true
         setView('dialog')
+        send('synapse:map-closed')
       }
       const send = (type, payload) => { frame.contentWindow?.postMessage({ source: 'dsh-synapse', type, ...payload }, location.origin) }
       let syncQueued = false
@@ -326,7 +327,7 @@ window.__ModuleLoader__.load({
           const sessionIds = new Set(sessions.map(session => session.id))
           const removedSessionIds = [...knownSessionIds].filter(id => !sessionIds.has(id))
           knownSessionIds = sessionIds
-          void fetch('/synapse/api/sessions/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessions, removedSessionIds }) }).catch(() => {})
+          void fetch('synapse/api/sessions/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessions, removedSessionIds }) }).catch(() => {})
         })
       }
       const syncTheme = () => {
@@ -375,6 +376,8 @@ window.__ModuleLoader__.load({
         if (event.data.type === 'synapse:close') return close()
         if (event.data.type === 'synapse:map-ready') return showMapOverlay()
         if (event.data.type === 'synapse:request-current') {
+          send(overlay.hidden ? 'synapse:map-closed' : 'synapse:map-visible')
+          publishLiveSessions()
           send('synapse:workspaces', { workspaces: workspaceSnapshot(ctx), archivedSessionIds: archivedSessionIds(ctx) })
           return send('synapse:current-session', { session: currentSession(ctx) })
         }

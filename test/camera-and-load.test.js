@@ -46,5 +46,5 @@ test('the poll refreshes quietly instead of re-running the whole load', () => {
   assert.match(source, /if \(state\.workspaceFingerprint === fingerprint\) return false/)
   assert.match(source, /state\.workspaceLoadBusy = false/)
   const projection = slice('async function refreshProjection()', 'function openNewSession')
-  assert.match(projection, /await refreshCurrentWorkspace\(\)/)
+  assert.match(projection, /return refreshCurrentWorkspace\(\)/)
 })
