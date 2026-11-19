@@ -1980,7 +1980,22 @@ function renderThread() {
   const waiting = state.pendingReplies.has(thread.dshSessionId)
   const latestAssistantSeq = [...messages].reverse().find(message => Number.isInteger(message.sourceSeq))?.sourceSeq
   const pager = `<nav class="detail-pages" aria-label="会话历史翻页"><button data-action="detail-prev" data-thread="${thread.id}" ${page.start === 0 ? 'disabled' : ''}>上一页</button><span>${page.total === 0 ? '暂无消息' : `${page.start + 1}–${page.start + messages.length} / ${page.total} 条消息`}</span><button data-action="detail-next" data-thread="${thread.id}" ${page.start >= page.lastStart ? 'disabled' : ''}>下一页</button></nav>`
-  return `<section class="detail-view"><header class="detail-head"><div class="detail-head-title"><div class="detail-head-meta"><span class="detail-badge">${thread.parentId === null ? '会话' : '分支'}</span>${thread.dshSessionTitle ?? thread.title ? `<span class="detail-subtitle">${escapeHtml(thread.dshSessionTitle ?? thread.title)}</span>` : ''}</div><h1>${escapeHtml(questionFor(thread))}</h1></div><div class="detail-head-actions"><button data-action="open-dsh" data-thread="${thread.id}" data-seq="${Number.isInteger(latestAssistantSeq) ? latestAssistantSeq : ''}" title="在原生对话中打开此会话">在 DSH 中打开</button><button data-action="open-branch" data-thread="${thread.id}" title="基于最新回答创建分支">创建分支</button><button class="primary" data-action="show-canvas">返回画布</button></div></header>${pager}<div class="detail-scroll">${messages.map(message => threadMessage(thread, message)).join('') || '<div class="note-empty">等待这条会话的第一条消息。</div>'}</div><form class="message-composer" data-compose="${thread.id}"><textarea maxlength="4000" placeholder="继续当前会话…" ${waiting ? 'disabled' : ''}></textarea><button class="primary" type="submit" ${waiting ? 'disabled' : ''}>${waiting ? '等待回复' : '发送'}</button></form></section>`
+  return `<section class="detail-view">
+    <header class="detail-head">
+      <div class="detail-head-title">
+        <div class="detail-head-meta"><span class="detail-badge">${thread.parentId === null ? '会话' : '分支'}</span>${thread.dshSessionTitle ?? thread.title ? `<span class="detail-subtitle">${escapeHtml(thread.dshSessionTitle ?? thread.title)}</span>` : ''}</div>
+        <h1 title="${escapeHtml(questionFor(thread))}">${escapeHtml(questionFor(thread))}</h1>
+      </div>
+      <div class="detail-head-actions">
+        <button type="button" data-action="open-dsh" data-thread="${thread.id}" data-seq="${Number.isInteger(latestAssistantSeq) ? latestAssistantSeq : ''}" title="在原生对话中打开此会话"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M7 3.5H4.5A1.5 1.5 0 0 0 3 5v6.5A1.5 1.5 0 0 0 4.5 13H11a1.5 1.5 0 0 0 1.5-1.5V9"/><path d="M9.5 3.5h3v3M12.4 3.6 7.5 8.5"/></svg>在 DSH 中打开</button>
+        <button type="button" data-action="open-branch" data-thread="${thread.id}" title="基于最新回答创建分支"><svg aria-hidden="true" viewBox="0 0 16 16"><circle cx="4" cy="3.5" r="1.5"/><circle cx="12" cy="3.5" r="1.5"/><circle cx="12" cy="12.5" r="1.5"/><path d="M5.5 3.5h2A2.5 2.5 0 0 1 10 6v5"/></svg>创建分支</button>
+        <button type="button" class="primary" data-action="show-canvas"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m6.5 3.5-4 4.5 4 4.5M3 8h10"/></svg>返回画布</button>
+      </div>
+    </header>
+    ${pager}
+    <div class="detail-scroll">${messages.map(message => threadMessage(thread, message)).join('') || '<div class="note-empty">等待这条会话的第一条消息。</div>'}</div>
+    <form class="message-composer" data-compose="${thread.id}"><textarea maxlength="4000" aria-label="继续当前会话" placeholder="继续当前会话…" ${waiting ? 'disabled' : ''}></textarea><button class="primary" type="submit" ${waiting ? 'disabled' : ''}>${waiting ? '等待回复' : '发送'}</button></form>
+  </section>`
 }
 
 function render() {
