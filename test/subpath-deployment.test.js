@@ -91,7 +91,7 @@ for (const prefix of ['/', '/dsh/', '/tools/dsh/']) {
     const syncUrl = new URL(syncPath, hostBase)
     assert.equal(syncUrl.pathname, `${prefix}synapse/api/sessions/sync`)
     assert.equal((await fetch(syncUrl, { method: 'POST' })).status, 200)
-    const context = vm.createContext({ URL, fetch, document: { baseURI: mapBase.href }, inspectorDebug: { enabled: false } })
+    const context = vm.createContext({ URL, fetch, document: { baseURI: mapBase.href } })
     vm.runInContext(`${apiSource}\nglobalThis.mapApi = api`, context)
     for (const [path, options] of [
       ['/synapse/api/workspaces', {}],

@@ -84,9 +84,6 @@ const bodyLoader = new SynapseCache.BodyLoader({
   cache: bodyCache,
   request: (path, signal) => api(path, { signal }),
   onUpdate: entries => {
-    // #region debug-point body-update
-    if (inspectorDebug.enabled) inspectorDebug.log('D', 'bodyLoader:onUpdate', 'body-update', { jobs: bodyLoader.jobs.size, failures: bodyLoader.failures.size })
-    // #endregion debug-point body-update
     if (!state.mapVisible || document.hidden) return
     if (state.mode === 'thread') render()
     else refreshLoadedBodies(entries)
@@ -95,186 +92,6 @@ const bodyLoader = new SynapseCache.BodyLoader({
 state.bodyFailures = bodyLoader.failures
 let cacheWorkspaceId = null
 let cacheThreadIds = new Set()
-
-// #region debug-point inspector-panel
-// Temporary, opt-in runtime evidence. Keep the panel outside #app so a map
-// reconciliation cannot destroy it. Never capture chat text or tool payloads.
-const inspectorDebug = (() => {
-  const endpoint = 'http://127.0.0.1:7777/event'
-  const pageId = crypto.randomUUID()
-  const events = []
-  const queue = []
-  const labels = {
-    'record-start': '开始记录', 'record-stop': '停止记录', 'user-flash': '已标记：侧栏闪退',
-    'card-click': '点击卡片', 'inspector-open': '设置侧栏选择', 'inspector-close': '主动关闭侧栏',
-      'close-timer': '关闭动画计时完成', 'session-sync': '收到宿主会话同步',
-      'session-status-only': '同一会话状态更新，保留卡片选择',
-    'session-clears': '会话同步清空侧栏', 'host-activate': '请求宿主切换会话',
-    'graph-check': '检查卡片是否还在图中', 'graph-clears': '图中缺少卡片，清空侧栏',
-    'prune': '工作区缓存检查', 'prune-clears': '工作区切换清空侧栏',
-    'workspace-input': '手动切换工作区', 'new-session': '新建会话', 'archive': '归档会话',
-    'button-click': '地图按钮操作', 'body-start': '开始请求正文', 'body-result': '正文请求完成',
-    'body-error': '正文请求未完成', 'body-update': '正文缓存更新', 'body-wanted': '登记需要加载的正文',
-    'body-paused': '暂停正文加载', 'render-before': '准备重绘', 'render-after': '重绘完成',
-    'dom-change': '侧栏 DOM 状态变化', 'release-dom': '释放隐藏地图的侧栏',
-    'map-visibility': '宿主改变地图可见性', 'page-visibility': '页面可见性变化',
-  }
-  let recording = false
-  let connected = true
-  let transport = '点击开始后连接采集器'
-  let sequence = 0
-  let delivered = 0
-  let dropped = 0
-  let pending = 0
-  let runNumber = 0
-  let runId = 'pre-fix'
-  let uiTimer = 0
-  let retryTimer = 0
-  let lastDomSignature = null
-  const panel = document.createElement('aside')
-  panel.className = 'inspector-debug'
-  panel.setAttribute('aria-label', '侧栏调试')
-  panel.innerHTML = `<button type="button" class="inspector-debug-toggle">侧栏调试</button>
-    <section class="inspector-debug-panel" hidden>
-      <header><strong>侧栏闪退调试</strong><button type="button" data-debug="fold">收起</button></header>
-      <p>点击开始后持续记录，手动点停止才结束。“标记闪退”只加标记。</p>
-      <div class="inspector-debug-actions">
-        <select aria-label="记录阶段"><option value="pre-fix">修复前</option><option value="post-fix">修复后</option></select>
-        <button type="button" data-debug="start">开始新记录</button>
-        <button type="button" data-debug="stop" disabled>停止</button>
-        <button type="button" data-debug="mark" disabled>标记闪退</button>
-        <button type="button" data-debug="export">导出日志</button>
-        <button type="button" data-debug="clear">清空面板</button>
-      </div>
-      <div class="inspector-debug-status" role="status"></div>
-      <pre class="inspector-debug-state"></pre>
-      <ol class="inspector-debug-events"></ol>
-      <small>仅记录卡片编号、加载和侧栏状态；面板最多保留 400 条。</small>
-    </section>`
-  document.body.append(panel)
-  const section = panel.querySelector('section')
-  const status = panel.querySelector('.inspector-debug-status')
-  const stateView = panel.querySelector('.inspector-debug-state')
-  const eventView = panel.querySelector('.inspector-debug-events')
-  const phase = panel.querySelector('select')
-  const snapshot = () => {
-    const inspector = app.querySelector('.card-inspector')
-    return {
-      workspaceId: state.workspace?.id ?? null, activeId: state.activeId,
-      selectedCardId: state.selectedCardId, inspectorCardId: state.inspectorCardId,
-      inspectorDom: inspector !== null, opening: inspector?.classList.contains('is-opening') ?? false,
-      closing: inspector?.classList.contains('is-closing') ?? false,
-      mapVisible: state.mapVisible, hidden: document.hidden, mode: state.mode,
-      graphCount: state.canvasCards?.length ?? 0, mountedCount: state.mountedCardIds.size,
-      workspaceBusy: state.workspaceLoadBusy,
-    }
-  }
-  const paint = () => {
-    uiTimer = 0
-    const view = snapshot()
-    panel.querySelector('.inspector-debug-toggle').textContent = recording ? `调试记录中 · ${events.length}` : '侧栏调试'
-    status.textContent = `${recording ? '记录中' : '已停止'} · ${transport} · 已送达 ${delivered} · 待发送 ${queue.length + pending} · 超限 ${dropped}`
-    status.dataset.failed = String(!connected)
-    stateView.textContent = `选中卡片：${view.inspectorCardId ?? '无'}\n侧栏元素：${view.inspectorDom ? '存在' : '不存在'} · 正文缓存：${bodyCache.size} 条 / ${(bodyCache.bytes / 1048576).toFixed(1)} MB\n正文请求：${bodyLoader.jobs.size} · 加载失败：${bodyLoader.failures.size}`
-    eventView.innerHTML = events.slice(-12).reverse().map(event =>
-      `<li><time>${escapeHtml(new Date(event.ts).toLocaleTimeString('zh-CN', { hour12: false }))}</time> ${escapeHtml(labels[event.msg.slice(8)] ?? event.msg)}<span>${escapeHtml(event.data.inspectorCardId ?? '无侧栏选择')}</span></li>`).join('')
-    panel.querySelector('[data-debug="stop"]').disabled = !recording
-    panel.querySelector('[data-debug="mark"]').disabled = !recording
-    panel.querySelector('[data-debug="start"]').disabled = recording || pending !== 0 || queue.length !== 0
-    phase.disabled = recording
-  }
-  const schedulePaint = () => { if (uiTimer === 0) uiTimer = window.setTimeout(paint, 150) }
-  const pump = () => {
-    if (retryTimer !== 0) return
-    while (pending < 2 && queue.length > 0) {
-      const event = queue.shift()
-      pending++
-      const controller = new AbortController()
-      const timer = window.setTimeout(() => controller.abort(), 2000)
-      fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event), signal: controller.signal })
-        .then(response => {
-          if (!response.ok) throw new Error('collector-http')
-          delivered++
-          connected = true
-          transport = '采集器已连接'
-        })
-        .catch(() => {
-          connected = false
-          if (queue.length < 100) queue.unshift(event)
-          else dropped++
-          transport = '连接异常，仍在本页记录；稍后自动重连，可导出日志'
-          if (retryTimer === 0) retryTimer = window.setTimeout(() => { retryTimer = 0; pump() }, 5000)
-        })
-        .finally(() => { window.clearTimeout(timer); pending--; schedulePaint(); pump() })
-    }
-  }
-  const log = (hypothesisId, location, name, data = {}) => {
-    if (!recording) return
-    const event = {
-      sessionId: 'early-card-flash', runId, hypothesisId, location, msg: `[DEBUG] ${name}`,
-      ts: Date.now(), data: { ...snapshot(), ...data, pageId, runNumber, eventSeq: ++sequence },
-    }
-    if (events.length === 400) events.shift()
-    events.push(event)
-    if (queue.length < 100) queue.push(event)
-    else dropped++
-    schedulePaint()
-    pump()
-  }
-  const observer = new MutationObserver(() => {
-    if (!recording) return
-    const view = snapshot()
-    const signature = JSON.stringify([view.inspectorCardId, view.inspectorDom, view.opening, view.closing, view.mapVisible, view.hidden, view.mode])
-    if (signature === lastDomSignature) return
-    lastDomSignature = signature
-    log('D', 'debug:MutationObserver', 'dom-change')
-  })
-  panel.addEventListener('click', event => {
-    const button = event.target.closest('button')
-    if (button === null) return
-    if (button.classList.contains('inspector-debug-toggle')) { section.hidden = !section.hidden; paint() }
-    if (button.dataset.debug === 'fold') section.hidden = true
-    if (button.dataset.debug === 'start' && !recording && pending === 0) {
-      events.length = 0
-      queue.length = 0
-      sequence = 0
-      delivered = 0
-      dropped = 0
-      connected = true
-      runNumber++
-      runId = phase.value
-      recording = true
-      transport = '正在连接采集器'
-      lastDomSignature = null
-      observer.observe(app, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] })
-      log('A-D', 'debug:panel', 'record-start', { cacheEntries: bodyCache.size, cacheBytes: bodyCache.bytes })
-      paint()
-    }
-    if (button.dataset.debug === 'stop') {
-      log('A-D', 'debug:panel', 'record-stop')
-      recording = false
-      observer.disconnect()
-      paint()
-    }
-    if (button.dataset.debug === 'mark') { log('A-D', 'debug:panel', 'user-flash'); paint() }
-    if (button.dataset.debug === 'clear') {
-      events.length = 0
-      paint()
-    }
-    if (button.dataset.debug === 'export') {
-      const blob = new Blob(events.map(event => `${JSON.stringify(event)}\n`), { type: 'application/x-ndjson' })
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = url
-      link.download = `synapse-early-card-flash-${runId}-${Date.now()}.ndjson`
-      link.click()
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-    }
-  })
-  paint()
-  return { get enabled() { return recording }, log, snapshot }
-})()
-// #endregion debug-point inspector-panel
 
 function bodyRevision(message) {
   // Source messages are immutable; tools may finish or be added afterward.
@@ -318,9 +135,6 @@ function clearViewCaches() {
 
 function prepareWorkspaceCaches(id) {
   if (state.workspace?.id === id) return
-  // #region debug-point workspace-caches
-  if (inspectorDebug.enabled) inspectorDebug.log('C', 'prepareWorkspaceCaches', 'prune', { nextWorkspaceId: id, operation: 'prepare' })
-  // #endregion debug-point workspace-caches
   clearViewCaches()
 }
 
@@ -331,9 +145,6 @@ function pruneWorkspaceCaches() {
   const sessions = new Set(threads.map(thread => thread.dshSessionId))
   const switched = cacheWorkspaceId !== (state.workspace?.id ?? null)
   const removed = switched || [...cacheThreadIds].some(id => !ids.has(id))
-  // #region debug-point workspace-caches
-  if (inspectorDebug.enabled) inspectorDebug.log('C', 'pruneWorkspaceCaches', 'prune', { cachedWorkspaceId: cacheWorkspaceId, switched, removed, threadCount: ids.size })
-  // #endregion debug-point workspace-caches
   const belongs = key => ids.has(key.slice(0, key.indexOf(':')))
   if (switched) clearViewCaches()
   else bodyLoader.retainThreads(ids)
@@ -350,9 +161,6 @@ function pruneWorkspaceCaches() {
     state.mountedCardIds.clear()
     connectorPathsByCard.clear()
     if (switched) {
-      // #region debug-point workspace-caches
-      if (inspectorDebug.enabled) inspectorDebug.log('C', 'pruneWorkspaceCaches:reset', 'prune-clears', { cachedWorkspaceId: cacheWorkspaceId })
-      // #endregion debug-point workspace-caches
       state.inspectorCardId = null; state.inspectorOpening = false; state.detailThreadId = null
     }
   }
@@ -370,9 +178,6 @@ function pauseMapBodies() {
 }
 
 function releaseRenderedBodies() {
-  // #region debug-point visibility
-  if (inspectorDebug.enabled) inspectorDebug.log('D', 'releaseRenderedBodies', 'release-dom')
-  // #endregion debug-point visibility
   // An iframe hidden by the host still retains its DOM. Drop the content,
   // keeping the viewport shell so camera measurements work on reopening.
   document.querySelector('.canvas-viewport')?.replaceChildren()
@@ -424,32 +229,13 @@ async function api(path, options = {}) {
   // Call sites use the server's logical /synapse namespace. Resolve requests
   // inside this map document so a prefix-stripping proxy keeps its public path.
   const url = new URL(path.replace(/^\/synapse\//, ''), document.baseURI)
-  // #region debug-point body-request
-  const traceBody = inspectorDebug.enabled && path.includes('/full?')
-  const traceStarted = traceBody ? performance.now() : 0
-  if (traceBody) inspectorDebug.log('D', 'api:request', 'body-start', { path })
-  // #endregion debug-point body-request
-  const response = await fetch(url, { ...options, headers: { 'content-type': 'application/json', ...(options.headers ?? {}) } }).catch(error => {
-    // #region debug-point body-request
-    if (traceBody) inspectorDebug.log('D', 'api:rejected', 'body-error', { path, aborted: options.signal?.aborted ?? false, errorName: error.name, elapsedMs: Math.round(performance.now() - traceStarted) })
-    // #endregion debug-point body-request
-    throw error
-  })
+  const response = await fetch(url, { ...options, headers: { 'content-type': 'application/json', ...(options.headers ?? {}) } })
   const body = await response.json().catch(() => ({}))
-  // #region debug-point body-request
-  if (traceBody) inspectorDebug.log('D', 'api:response', 'body-result', {
-    path, status: response.status, elapsedMs: Math.round(performance.now() - traceStarted),
-    returnedSeqs: Object.keys(body.messages ?? {}).slice(0, 20), nextCursor: body.nextCursor ?? null,
-  })
-  // #endregion debug-point body-request
   if (!response.ok) throw Object.assign(new Error(body.error ?? '请求失败'), { status: response.status })
   return body
 }
 
 function post(type, payload = {}) {
-  // #region debug-point host-session
-  if (inspectorDebug.enabled && type === 'synapse:activate-session') inspectorDebug.log('A', 'post:activate-session', 'host-activate', { sessionId: payload.sessionId })
-  // #endregion debug-point host-session
   if (window.parent !== window) window.parent.postMessage({ source: 'dsh-synapse', type, ...payload }, window.location.origin)
 }
 
@@ -709,9 +495,6 @@ async function refreshProjection() {
 
 function openNewSession() {
   if (state.draft !== null) return
-  // #region debug-point inspector-selection
-  if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'openNewSession', 'new-session')
-  // #endregion debug-point inspector-selection
   state.mode = 'canvas'
   state.activeId = null
   state.selectedCardId = null
@@ -726,9 +509,6 @@ function openNewSession() {
 }
 
 async function archiveThread(thread) {
-  // #region debug-point inspector-selection
-  if (inspectorDebug.enabled) inspectorDebug.log('C', 'archiveThread', 'archive', { threadId: thread.id })
-  // #endregion debug-point inspector-selection
   // A DSH-backed thread is archived in DSH itself, so the sidebar and this map
   // share one archive set (issue #21 / #19). Keeping a second local delete is
   // what made the map claim "archived" while DSH still listed the session.
@@ -1782,9 +1562,6 @@ function syncCanvasDraft() {
 
 function renderCanvas() {
   const threads = visibleThreads(state.workspace?.threads ?? [])
-  // #region debug-point graph-render
-  if (inspectorDebug.enabled && threads.length === 0) inspectorDebug.log('B', 'renderCanvas:empty', 'graph-check', { threadCount: 0 })
-  // #endregion debug-point graph-render
   if (threads.length === 0 && state.draft?.kind !== 'new') {
     clearViewCaches()
     state.inspectorCardId = null
@@ -1793,17 +1570,7 @@ function renderCanvas() {
   }
   ensureCanvasGraph(threads)
   const cards = state.canvasCards
-  // #region debug-point graph-render
-  if (inspectorDebug.enabled && state.inspectorCardId !== null) inspectorDebug.log('B', 'renderCanvas:graph', 'graph-check', {
-    allCardCount: canvasGraphCache.allById.size, filteredCardCount: cards.length,
-    inAllCards: canvasGraphCache.allById.has(state.inspectorCardId),
-    inGraph: state.canvasCardsById.has(state.inspectorCardId), collapsedCount: state.collapsedCardIds.size,
-  })
-  // #endregion debug-point graph-render
   if (state.inspectorCardId !== null && !canvasGraphCache.allById.has(state.inspectorCardId)) {
-    // #region debug-point graph-render
-    if (inspectorDebug.enabled) inspectorDebug.log('B', 'renderCanvas:reset', 'graph-clears')
-    // #endregion debug-point graph-render
     state.inspectorCardId = null
     state.inspectorOpening = false
   }
@@ -2000,9 +1767,6 @@ function renderThread() {
 
 function render() {
   if (!state.mapVisible || document.hidden) return
-  // #region debug-point graph-render
-  if (inspectorDebug.enabled) inspectorDebug.log('B-D', 'render:begin', 'render-before')
-  // #endregion debug-point graph-render
   // Remember the departing thread's scroll position per thread id, so
   // switching sessions restores each conversation's own place instead of
   // smearing one session's position onto another.
@@ -2085,9 +1849,6 @@ function render() {
   }
   // Card faces and the detail view only hold previews: pull the real bodies for
   // whatever is on screen right now (issue #42).
-  // #region debug-point graph-render
-  if (inspectorDebug.enabled) inspectorDebug.log('B-D', 'render:end', 'render-after')
-  // #endregion debug-point graph-render
   if (state.mode !== 'canvas') hydrateBodies()
 }
 
@@ -2098,9 +1859,6 @@ function render() {
  */
 function hydrateBodies() {
   if (!state.mapVisible || document.hidden || state.workspaceLoadBusy) {
-    // #region debug-point body-update
-    if (inspectorDebug.enabled) inspectorDebug.log('D', 'hydrateBodies:pause', 'body-paused')
-    // #endregion debug-point body-update
     bodyLoader.pause(); return
   }
   const wanted = []
@@ -2130,11 +1888,6 @@ function hydrateBodies() {
   const viewKey = state.mode === 'thread'
     ? `thread:${state.activeId}:${currentThread() === null ? 0 : detailPage(currentThread()).start}`
     : `canvas:${state.inspectorCardId ?? ''}`
-  // #region debug-point body-update
-  if (inspectorDebug.enabled && state.inspectorCardId !== null) inspectorDebug.log('D', 'hydrateBodies:sync', 'body-wanted', {
-    viewKey, wantedCount: wanted.length, priorityMessages: wanted.slice(0, 3).map(item => [item.threadId, item.seq]),
-  })
-  // #endregion debug-point body-update
   bodyLoader.sync(wanted, viewKey)
 }
 
@@ -2177,9 +1930,6 @@ function renderPreservingDetailScroll() {
 
 let inspectorCloseTimer = 0
 function openCardInspector(cardId) {
-  // #region debug-point inspector-selection
-  if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'openCardInspector', 'inspector-open', { nextCardId: cardId, cancelledCloseTimer: inspectorCloseTimer !== 0 })
-  // #endregion debug-point inspector-selection
   if (inspectorCloseTimer !== 0) {
     window.clearTimeout(inspectorCloseTimer)
     inspectorCloseTimer = 0
@@ -2190,9 +1940,6 @@ function openCardInspector(cardId) {
 
 function closeCardInspector({ animate = true } = {}) {
   if (state.inspectorCardId === null) return
-  // #region debug-point inspector-selection
-  if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'closeCardInspector', 'inspector-close', { animate })
-  // #endregion debug-point inspector-selection
   if (inspectorCloseTimer !== 0) window.clearTimeout(inspectorCloseTimer)
   const cardId = state.inspectorCardId
   const inspector = document.querySelector('.card-inspector')
@@ -2206,9 +1953,6 @@ function closeCardInspector({ animate = true } = {}) {
   inspectorCloseTimer = window.setTimeout(() => {
     inspectorCloseTimer = 0
     if (state.inspectorCardId !== cardId) return
-    // #region debug-point inspector-selection
-    if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'closeCardInspector:timer', 'close-timer')
-    // #endregion debug-point inspector-selection
     state.inspectorCardId = null
     state.inspectorOpening = false
     render()
@@ -2614,12 +2358,6 @@ app.addEventListener('click', async event => {
     if (thread === undefined) return
     const cardId = card.dataset.cardId
     if (cardId === undefined) return
-    // #region debug-point inspector-selection
-    if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'click:card', 'card-click', {
-      clickedCardId: cardId, clickedThreadId: thread.id, clickedSessionId: thread.dshSessionId,
-      currentSessionId: state.currentDsh?.id ?? null,
-    })
-    // #endregion debug-point inspector-selection
     state.activeId = thread.id
     state.selectedCardId = cardId
     openCardInspector(cardId)
@@ -2635,9 +2373,6 @@ app.addEventListener('click', async event => {
     return
   }
   const thread = state.workspace?.threads.find(item => item.id === button.dataset.thread)
-  // #region debug-point inspector-selection
-  if (inspectorDebug.enabled) inspectorDebug.log('A-D', 'click:button', 'button-click', { action: button.dataset.action, threadId: thread?.id ?? null, cardId: button.dataset.card ?? null })
-  // #endregion debug-point inspector-selection
   try {
     if (button.dataset.action === 'follow-selection') {
       const followup = selectionFollowup
@@ -2752,9 +2487,6 @@ app.addEventListener('change', event => {
   const select = event.target.closest('[data-action="select-workspace"]')
   if (!(select instanceof HTMLSelectElement)) return
   const choice = workspaceChoices().find(item => item.id === select.value)
-  // #region debug-point workspace-caches
-  if (inspectorDebug.enabled) inspectorDebug.log('C', 'change:workspace', 'workspace-input', { nextWorkspaceId: choice?.id ?? null })
-  // #endregion debug-point workspace-caches
   state.inspectorCardId = null
   state.inspectorOpening = false
   if (choice?.source === 'dsh') {
@@ -2788,9 +2520,6 @@ app.addEventListener('submit', event => {
 window.addEventListener('message', event => {
   if (event.origin !== window.location.origin || event.data?.source !== 'dsh-synapse') return
   const data = event.data
-  // #region debug-point visibility
-  if (inspectorDebug.enabled && ['synapse:map-opened', 'synapse:map-closed', 'synapse:map-visible'].includes(data.type)) inspectorDebug.log('D', 'message:map', 'map-visibility', { type: data.type })
-  // #endregion debug-point visibility
   if (data.type === 'synapse:map-opened') {
     state.mapVisible = true
     // Do NOT reset the camera here: toggling dialog<->map for the same
@@ -2833,23 +2562,12 @@ window.addEventListener('message', event => {
     const nextSignature = sessionSignature(data.session)
     const preserveCanvasCamera = previousId !== data.session?.id && state.mapCardSessionSwitches.delete(data.session?.id)
     const thread = currentDshThread()
-    // #region debug-point host-session
-    if (inspectorDebug.enabled) inspectorDebug.log('A', 'message:current-session', 'session-sync', {
-      previousSessionId: previousId ?? null, incomingSessionId: data.session?.id ?? null,
-      incomingThreadId: thread?.id ?? null, preserveSelectedCard: thread !== undefined && state.activeId === thread.id,
-      preserveCanvasCamera, sessionChanged: previousId !== data.session?.id,
-    })
-    if (inspectorDebug.enabled && previousId === data.session?.id && thread?.id !== state.activeId) inspectorDebug.log('A', 'message:current-session:status', 'session-status-only')
-    // #endregion debug-point host-session
     // A status update for the old host session can arrive while a map click is
     // opening another session. Only actual navigation reconciles selection.
     if (thread !== undefined && previousId !== data.session?.id) {
       const preserveSelectedCard = state.activeId === thread.id
       state.activeId = thread.id
       if (!preserveSelectedCard) {
-        // #region debug-point host-session
-        if (inspectorDebug.enabled) inspectorDebug.log('A', 'message:current-session:reset', 'session-clears', { incomingThreadId: thread.id })
-        // #endregion debug-point host-session
         state.selectedCardId = null
         state.inspectorCardId = null
         state.inspectorOpening = false
@@ -2897,9 +2615,6 @@ window.addEventListener('message', event => {
 
 post('synapse:request-current')
 document.addEventListener('visibilitychange', () => {
-  // #region debug-point visibility
-  if (inspectorDebug.enabled) inspectorDebug.log('D', 'visibilitychange', 'page-visibility')
-  // #endregion debug-point visibility
   if (document.hidden) { clearViewCaches(); state.liveReplies.clear(); hideSelectionFollowup(); releaseRenderedBodies() }
   else if (state.mapVisible) { post('synapse:request-current'); render() }
 })

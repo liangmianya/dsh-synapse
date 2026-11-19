@@ -40,7 +40,6 @@ function harness() {
     Date: class extends Date { static now() { return now } },
     document: { hidden: false, activeElement: null, baseURI: 'http://local/synapse/' },
     window: { requestAnimationFrame() {} },
-    inspectorDebug: { enabled: false },
     state: {
       summaries: [], workspace: null, activeId: null, currentDsh: null,
       dshWorkspaces: groups, selectedDshWorkspaceId: null,
