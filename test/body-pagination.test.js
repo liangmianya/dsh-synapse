@@ -21,6 +21,7 @@ function harness(count = 95) {
   const context = vm.createContext({
     DETAIL_PAGE_MESSAGES: 40, AbortController,
     document: { hidden: false },
+    inspectorDebug: { enabled: false }, canvasGraphCache: null,
     state: {
       workspace: { id: 'workspace', threads: [thread, other] }, mode: 'thread', activeId: 'a', mapVisible: true,
       bodyFailures: new Set(),
@@ -40,7 +41,8 @@ function harness(count = 95) {
   })
   vm.runInContext([
     cacheSource,
-    snippet('const bodyCache =', 'function rememberBranchAnchor('),
+    snippet('const bodyCache =', '// #region debug-point inspector-panel'),
+    snippet('function bodyRevision(', 'function rememberBranchAnchor('),
     snippet('function detailPage(', 'function render() {'),
     snippet('function hydrateBodies()', 'function renderPreservingDetailScroll'),
     snippet('function bodyNotice(', 'function threadMessage('),

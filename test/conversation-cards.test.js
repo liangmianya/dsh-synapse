@@ -5,11 +5,12 @@ import vm from 'node:vm'
 
 async function loadConversationCards() {
   const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+  const cacheSource = await readFile(new URL('../browser-cache.js', import.meta.url), 'utf8')
   const start = source.indexOf('function overlapsCard')
   const end = source.indexOf('function canvasConnectors')
   const context = { globalThis: {}, CARD_WIDTH: 310, CARD_HEIGHT: 276, CARD_GAP_Y: 42, CAMERA_INSET_X: 56, CAMERA_INSET_Y: 56, messagesFor: thread => thread.messages, state: { branchAnchors: new Map(), cardPositions: new Map(), liveReplies: new Map(), collapsedCardIds: new Set() } }
   vm.createContext(context)
-  vm.runInContext(`${source.slice(start, end)};globalThis.conversationCards = conversationCards;globalThis.conversationGraphView = conversationGraphView;globalThis.initialCanvasCamera = initialCanvasCamera`, context)
+  vm.runInContext(`${cacheSource}\n${source.slice(start, end)};globalThis.conversationCards = conversationCards;globalThis.conversationGraphView = conversationGraphView;globalThis.initialCanvasCamera = initialCanvasCamera`, context)
   return { conversationCards: context.globalThis.conversationCards, conversationGraphView: context.globalThis.conversationGraphView, initialCanvasCamera: context.globalThis.initialCanvasCamera, state: context.state }
 }
 

@@ -36,10 +36,11 @@ function harness() {
     throw new Error(`unexpected request: ${path}`)
   }
   const context = vm.createContext({
-    TextEncoder,
+    TextEncoder, URL,
     Date: class extends Date { static now() { return now } },
-    document: { hidden: false, activeElement: null },
+    document: { hidden: false, activeElement: null, baseURI: 'http://local/synapse/' },
     window: { requestAnimationFrame() {} },
+    inspectorDebug: { enabled: false },
     state: {
       summaries: [], workspace: null, activeId: null, currentDsh: null,
       dshWorkspaces: groups, selectedDshWorkspaceId: null,
@@ -48,7 +49,9 @@ function harness() {
       workspaceFingerprint: null, workspaceSummariesSignature: null, workspaceDshSignature: null, error: '',
       mapVisible: true,
     },
-    async fetch(path, options) {
+    async fetch(input, options) {
+      const url = new URL(input, context.document.baseURI)
+      const path = url.pathname + url.search
       requests.push({ path, options })
       const body = await responder(path, options)
       return { ok: true, status: 200, json: async () => plain(body) }

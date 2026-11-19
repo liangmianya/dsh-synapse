@@ -370,7 +370,11 @@ test('mounts one switch and one hidden map overlay into the page', async () => {
   const bridge = await loadBridge()
 
   assert.equal(bridge.shell().className, 'dsh-synapse-host')
+  assert.equal(descendants(bridge.shell()).filter(node => matches(node, '.dsh-synapse-switch')).length, 1)
+  assert.equal(descendants(bridge.shell()).filter(node => matches(node, 'iframe')).length, 1)
   assert.equal(bridge.overlay().hidden, true)
+  // The iframe asks for visibility once its message listener is ready.
+  bridge.message({ type: 'synapse:request-current' })
   assert.equal(bridge.postedOf('synapse:map-closed').length, 1)
 })
 
