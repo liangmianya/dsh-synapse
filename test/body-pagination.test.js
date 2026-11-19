@@ -139,12 +139,17 @@ test('body request single-flight keys prevent duplicate hydration during a pendi
   assert.equal(h.loader.jobs.size, 0)
 })
 
-test('truncated and preview content display actionable DSH notices', () => {
+test('previews show loading or retry while truncated content points to DSH', async () => {
   const h = harness()
-  for (const message of [{ previewOnly: true }, { hydrated: true, truncated: true }, { processTruncated: true }]) {
+  const preview = { ...h.thread.messages[80], previewOnly: true }
+  assert.match(h.context.bodyNotice(h.thread, preview), /正在加载正文/)
+  for (const message of [{ hydrated: true, truncated: true }, { processTruncated: true }]) {
     assert.match(h.context.bodyNotice(h.thread, message), /DSH/)
   }
   assert.equal(h.context.bodyNotice(h.thread, { sourceSeq: 0, hydrated: true }), '')
+  h.setResponder(async () => ({ messages: {}, nextCursor: null }))
+  await h.hydrate()
+  assert.match(h.context.bodyNotice(h.thread, preview), /data-action="retry-bodies"/)
   const page = h.context.detailPage(h.thread)
   assert.deepEqual(plain(page.messages.map(message => message.sourceSeq)), Array.from({ length: 15 }, (_, i) => 80 + i))
 })
