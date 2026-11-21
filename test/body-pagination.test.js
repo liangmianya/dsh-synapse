@@ -42,6 +42,7 @@ function harness(count = 95) {
   vm.runInContext([
     cacheSource,
     snippet('const bodyCache =', 'function rememberBranchAnchor('),
+    snippet('function setCanvasFocus(', 'function focusActiveCard('),
     snippet('function detailPage(', 'function render() {'),
     snippet('function hydrateBodies()', 'function renderPreservingDetailScroll'),
     snippet('function bodyNotice(', 'function threadMessage('),

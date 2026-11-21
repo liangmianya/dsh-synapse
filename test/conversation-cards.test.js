@@ -341,7 +341,7 @@ test('a new descendant remains hidden while its ancestor is collapsed', async ()
   assert.equal(graph.descendantCounts.get(collapsedId), 2)
 })
 
-test('nested collapsed nodes remain visible when their ancestor is expanded', async () => {
+test('a collapsed ancestor hides nested collapse controls and expanding it preserves the child fold', async () => {
   const { conversationCards, conversationGraphView } = await loadConversationCards()
   const cards = conversationCards([{
     id: 'session-1', parentId: null,
@@ -355,7 +355,7 @@ test('nested collapsed nodes remain visible when their ancestor is expanded', as
   }])
 
   const nested = conversationGraphView(cards, new Set([cards[0].id, cards[1].id]))
-  assert.deepEqual(Array.from(nested.cards, card => card.question), ['第一轮', '第二轮'])
+  assert.deepEqual(Array.from(nested.cards, card => card.question), ['第一轮'])
   const childOnly = conversationGraphView(cards, new Set([cards[1].id]))
   assert.deepEqual(Array.from(childOnly.cards, card => card.question), ['第一轮', '第二轮'])
 })

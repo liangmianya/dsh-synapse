@@ -105,9 +105,18 @@ The canvas supports:
 - Panning and zooming up to 4×.
 - Dragging cards with persisted positions.
 - Expanding or collapsing descendant conversation subtrees.
-- One-click focus on the current session.
+- Showing only the selected session and its derived branches while keeping the current camera and zoom.
+- One-click centering on the current session.
 - Smooth card scrolling and Markdown table rendering.
 - Folding tool calls and results into the related assistant answer by `callId`.
+
+### Session focus and subtree folding
+
+The map starts in **全工作区 (Entire workspace)** mode. Select a session in the sidebar and click **聚焦会话 (Focus session)** to show every turn of that session and its recursively derived branches. The sidebar still lists all sessions. Selecting another sidebar session changes the focus root; selecting a child session includes that child and its descendants, excluding its parent and siblings.
+
+Clicking a branch card activates its DSH session and opens its details while keeping the existing focus scope. Switching between Entire workspace and Focus session only changes card and connector visibility. It keeps the current camera, zoom and card coordinates, including any pan or zoom changes made while focused. Use **定位 (Locate)** separately when you want to center the current session.
+
+A card's **−** button hides every descendant, including children that are already folded, while keeping the card itself visible. Its **+** button expands the subtree again, preserving each child's own fold state and manually dragged position.
 
 The **Dialogue / Session Map** switch can be moved too:
 
@@ -117,6 +126,12 @@ The **Dialogue / Session Map** switch can be moved too:
 - It always keeps an 8px grab margin from the viewport edges, so shrinking the window cannot strand it off screen.
 
 ## Recent changes
+
+**Unreleased · 2026-11-21**
+
+- Added session focus with all turns and recursively derived branches, while keeping the entire workspace's session list in the sidebar.
+- Switching the display scope only changes visibility and preserves the current camera, zoom and card positions.
+- Fixed nested folding: folded children no longer remain visible when their parent is collapsed, and their own fold state is retained when the parent expands.
 
 **0.5.6**
 

@@ -25,6 +25,17 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 .canvas-controls button { min-width: 32px; padding: 0 8px; font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
 .canvas-controls button svg { width: 14px; height: 14px; flex: none; }
 .canvas-controls span { min-width: 42px; color: #64748b; font-size: 12px; text-align: center; }
+.canvas-scope-controls { display: flex; flex: none; gap: 2px; margin-right: 5px; padding: 2px; border: 1px solid #d8dee8; border-radius: 8px; background: #fff; }
+.canvas-scope-controls button { min-height: 26px; border-color: transparent; background: transparent; white-space: nowrap; }
+.canvas-scope-controls button[aria-pressed="true"] { background: #e8f0ff; color: #2563eb; }
+.canvas-focus-label { position: absolute; z-index: 4; top: 12px; left: 16px; display: flex; align-items: center; gap: 8px; max-width: calc(100% - 32px); padding: 7px 10px; border: 1px solid #d8dee8; border-radius: 8px; background: #fff; color: #475569; font-size: 12px; pointer-events: none; }
+.canvas-focus-label strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.canvas-focus-label span { flex: none; color: #64748b; font-size: 11px; }
+.canvas-focus-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 48px 24px; color: #64748b; font-size: 13px; pointer-events: none; }
+@media (max-width: 760px) {
+  .canvas-controls { position: static; width: 100%; min-width: 0; overflow-x: auto; padding: 3px 0; }
+  .canvas-controls > button, .canvas-zoom-label { flex: none; }
+}
 .sidebar { grid-row: 1 / -1; display: flex; flex-direction: column; gap: 0; min-height: 0; padding: 6px 12px; border-right: 1px solid #e5e7eb; background: #f8f9fa; }
 .new-workspace { display: flex; width: calc(100% - 4px); min-height: auto; height: 38px; align-items: center; justify-content: center; gap: 6px; margin: 0 2px 8px; border-color: rgba(0,0,0,.1); border-radius: 12px; background: #fff; padding: 8px 16px; color: #111827; font-size: 14px; font-weight: 500; }
 .new-session-icon { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
@@ -470,4 +481,9 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 [data-theme="dark"] button:hover { border-color: #4a4f57; background: #26282d; color: #fff; }
 [data-theme="dark"] button.primary { border-color: #3478f6; background: #3478f6; color: #fff; }
 [data-theme="dark"] button.primary:hover { border-color: #2563eb; background: #2563eb; color: #fff; }
+[data-theme="dark"] .canvas-scope-controls { border-color: #2a2d33; background: #15171b; }
+[data-theme="dark"] .canvas-scope-controls button { border-color: transparent; background: transparent; }
+[data-theme="dark"] .canvas-scope-controls button[aria-pressed="true"] { background: #1e2a44; color: #7ea6f5; }
+[data-theme="dark"] .canvas-focus-label { border-color: #2a2d33; background: #1b1c1f; color: #d7dae0; }
+[data-theme="dark"] .canvas-focus-label span, [data-theme="dark"] .canvas-focus-empty { color: #8f959e; }
 @media (max-width: 760px) { [data-theme="dark"] .card-inspector { border-top-color: #2a2d33; border-left: 0; } }
