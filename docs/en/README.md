@@ -127,7 +127,7 @@ The **Dialogue / Session Map** switch can be moved too:
 
 ## Recent changes
 
-**Unreleased · 2026-11-21**
+**0.5.8 · 2026-11-22**
 
 - Added session focus with all turns and recursively derived branches, while keeping the entire workspace's session list in the sidebar.
 - Switching the display scope only changes visibility and preserves the current camera, zoom and card positions.
