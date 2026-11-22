@@ -60,6 +60,7 @@ const OVERVIEW_ZOOM = .55
 const DETAIL_PAGE_MESSAGES = 40
 const state = {
   summaries: [], workspace: null, activeId: null, selectedCardId: null, mode: 'canvas', zoom: 1, currentDsh: null, sidebarCollapsed: false,
+  focusedThreadId: null, canvasFocusRevision: 0,
   dshWorkspaces: [], selectedDshWorkspaceId: null,
   historyBySession: new Map(), historyRequests: new Map(), pendingReplies: new Map(), pendingRpc: new Map(), liveReplies: new Map(),
   // Message bodies are not part of the workspace payload; they are fetched per
@@ -144,6 +145,7 @@ function pruneWorkspaceCaches() {
   const ids = new Set(threads.map(thread => thread.id))
   const sessions = new Set(threads.map(thread => thread.dshSessionId))
   const switched = cacheWorkspaceId !== (state.workspace?.id ?? null)
+  reconcileCanvasFocus(threads, switched)
   const removed = switched || [...cacheThreadIds].some(id => !ids.has(id))
   const belongs = key => ids.has(key.slice(0, key.indexOf(':')))
   if (switched) clearViewCaches()
@@ -371,12 +373,12 @@ async function openDshWorkspace(id, { renderAfter = true, preserveCanvasCamera =
     state.workspaceDshSignature = JSON.stringify(workspace)
     const currentThread = currentDshThread(state.workspace.threads)
     state.activeId = currentThread?.id ?? (state.workspace.threads.some(thread => thread.id === state.activeId) ? state.activeId : state.workspace.threads[0]?.id ?? null)
-    if (currentThread !== undefined) revealConversationThread(conversationCards(state.workspace.threads), currentThread.id)
+    if (currentThread !== undefined && state.focusedThreadId === null) revealConversationThread(conversationCards(state.workspace.threads), currentThread.id)
     if (renderAfter && canReplaceView()) render()
     await Promise.all(state.workspace.threads.map(thread => loadThreadHistory(thread, false)))
     if (renderAfter && load === state.workspaceLoad && canReplaceView()) render()
     // After a user switch, bring that workspace's active conversation on screen.
-    if (userInitiated && load === state.workspaceLoad) window.requestAnimationFrame(() => { if (state.mode === 'canvas') focusActiveCard() })
+    if (userInitiated && load === state.workspaceLoad) queueActiveCardFocus()
     return true
   } finally {
     if (load === state.workspaceLoad) {
@@ -495,6 +497,7 @@ async function refreshProjection() {
 
 function openNewSession() {
   if (state.draft !== null) return
+  setCanvasFocus(null)
   state.mode = 'canvas'
   state.activeId = null
   state.selectedCardId = null
@@ -1070,6 +1073,31 @@ function conversationCards(threads) {
   return layoutConversationGraph(cards, threads)
 }
 
+function conversationThreadScope(threads, rootId) {
+  if (rootId === null || rootId === undefined) return null
+  const children = new Map()
+  for (const thread of threads) {
+    if (!children.has(thread.parentId)) children.set(thread.parentId, [])
+    children.get(thread.parentId).push(thread.id)
+  }
+  // Thread lineage also covers forks whose intermediate session has no turns.
+  // Iteration and the visited set handle deep trees and malformed cycles.
+  const ids = new Set()
+  const pending = threads.some(thread => thread.id === rootId) ? [rootId] : []
+  while (pending.length > 0) {
+    const id = pending.pop()
+    if (ids.has(id)) continue
+    ids.add(id)
+    for (const childId of children.get(id) ?? []) if (!ids.has(childId)) pending.push(childId)
+  }
+  return ids
+}
+
+function scopedConversationCards(cards, threads, rootId = state.focusedThreadId) {
+  const ids = conversationThreadScope(threads, rootId)
+  return ids === null ? cards : cards.filter(card => ids.has(card.dshThreadId))
+}
+
 function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds) {
   const cardIds = new Set(cards.map(card => card.id))
   const childrenByParent = new Map()
@@ -1081,12 +1109,14 @@ function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds)
   }
 
   const hiddenIds = new Set()
+  const cyclicCollapsedIds = new Set()
   for (const rootId of collapsedCardIds) {
     if (!cardIds.has(rootId)) continue
     const visited = new Set([rootId])
     const pending = [rootId]
     while (pending.length > 0) {
       for (const childId of childrenByParent.get(pending.pop()) ?? []) {
+        if (childId === rootId) cyclicCollapsedIds.add(rootId)
         if (visited.has(childId)) continue
         visited.add(childId)
         hiddenIds.add(childId)
@@ -1095,9 +1125,9 @@ function conversationGraphView(cards, collapsedCardIds = state.collapsedCardIds)
     }
   }
 
-  // Persisted collapse roots must remain visible even if malformed metadata
-  // contains a cycle where two collapsed nodes otherwise hide each other.
-  for (const rootId of collapsedCardIds) hiddenIds.delete(rootId)
+  // A collapsed child still belongs to its ancestor's hidden subtree.
+  // Only actual parent cycles need an exception to keep their controls usable.
+  for (const rootId of cyclicCollapsedIds) hiddenIds.delete(rootId)
 
   // Post-order accumulation: each card's descendant count is 1 + the sum of
   // its children's subtree sizes, so the whole graph is O(n) instead of a BFS
@@ -1329,9 +1359,13 @@ function cancelRegionWork() {
 }
 
 function ensureCanvasGraph(threads) {
-  if (canvasGraphCache?.workspace === state.workspace && canvasGraphCache.revision === canvasGraphRevision) return
+  if (canvasGraphCache?.workspace === state.workspace && canvasGraphCache.revision === canvasGraphRevision
+    && canvasGraphCache.focusedThreadId === state.focusedThreadId) return
+  // Lay out the complete workspace before filtering, so focusing never moves
+  // automatically positioned cards or changes the saved drag coordinates.
   const allCards = conversationCards(threads)
-  const graph = conversationGraphView(allCards)
+  const scopedCards = scopedConversationCards(allCards, threads)
+  const graph = conversationGraphView(scopedCards)
   const index = new SynapseCache.RegionIndex()
   const children = new Map()
   const byMessage = new Map()
@@ -1347,8 +1381,8 @@ function ensureCanvasGraph(threads) {
       if (Number.isInteger(message?.sourceSeq)) byMessage.set(`${card.dshThreadId}:${message.sourceSeq}`, card.id)
     }
   }
-  canvasGraphCache = { workspace: state.workspace, revision: canvasGraphRevision, graph, index, children, byMessage,
-    allById: new Map(allCards.map(card => [card.id, card])), latestByThread,
+  canvasGraphCache = { workspace: state.workspace, revision: canvasGraphRevision, focusedThreadId: state.focusedThreadId, graph, index, children, byMessage,
+    allById: new Map(allCards.map(card => [card.id, card])), scopeCardIds: new Set(scopedCards.map(card => card.id)), latestByThread,
     threadById: new Map(threads.map(thread => [thread.id, thread])) }
   state.canvasCards = graph.cards
   state.canvasCardsById = new Map(graph.cards.map(card => [card.id, card]))
@@ -1560,6 +1594,12 @@ function syncCanvasDraft() {
   }
 }
 
+function canvasScopeControls(threads) {
+  const focused = state.focusedThreadId !== null
+  const canFocus = threads.some(thread => thread.id === state.activeId)
+  return `<div class="canvas-scope-controls" role="group" aria-label="地图显示范围"><button type="button" data-action="show-workspace" aria-pressed="${!focused}" ${state.draft !== null ? 'disabled' : ''}>全工作区</button><button type="button" data-action="focus-thread" aria-pressed="${focused}" title="只显示选中会话及其派生分支" ${!canFocus || state.draft !== null ? 'disabled' : ''}>聚焦会话</button></div>`
+}
+
 function renderCanvas() {
   const threads = visibleThreads(state.workspace?.threads ?? [])
   if (threads.length === 0 && state.draft?.kind !== 'new') {
@@ -1570,7 +1610,7 @@ function renderCanvas() {
   }
   ensureCanvasGraph(threads)
   const cards = state.canvasCards
-  if (state.inspectorCardId !== null && !canvasGraphCache.allById.has(state.inspectorCardId)) {
+  if (state.inspectorCardId !== null && !canvasGraphCache.scopeCardIds.has(state.inspectorCardId)) {
     state.inspectorCardId = null
     state.inspectorOpening = false
   }
@@ -1582,7 +1622,10 @@ function renderCanvas() {
     state.canvasNeedsCenter = true
   }
   const inspector = state.inspectorCardId === null ? '' : renderCardInspector(canvasGraphCache.allById.get(state.inspectorCardId))
-  return `<section class="canvas-view" data-morph-key="canvas"><div class="canvas-viewport"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors" data-morph-key="links:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></svg><div class="cards-layer" data-morph-key="cards:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></div></div></div><div class="region-status" role="status" hidden><i aria-hidden="true"></i><span></span><button type="button" data-action="retry-bodies" hidden>重试</button></div>${inspector}</section>`
+  const focusedThread = threads.find(thread => thread.id === state.focusedThreadId)
+  const focusLabel = focusedThread === undefined ? '' : `<div class="canvas-focus-label" title="${escapeHtml(threadListTitle(focusedThread))}"><strong>聚焦：${escapeHtml(threadListTitle(focusedThread))}</strong><span>含派生分支</span></div>`
+  const focusEmpty = focusedThread !== undefined && cards.length === 0 ? '<div class="canvas-focus-empty">该会话及其分支还没有可显示的对话。</div>' : ''
+  return `<section class="canvas-view" data-morph-key="canvas"><div class="canvas-viewport"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors" data-morph-key="links:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></svg><div class="cards-layer" data-morph-key="cards:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></div></div></div>${focusLabel}${focusEmpty}<div class="region-status" role="status" hidden><i aria-hidden="true"></i><span></span><button type="button" data-action="retry-bodies" hidden>重试</button></div>${inspector}</section>`
 }
 
 function isProcessMessage(message) {
@@ -1798,7 +1841,7 @@ function render() {
   const view = state.mode === 'thread' ? renderThread() : renderCanvas()
   const choices = workspaceChoices()
   const selectedWorkspaceId = state.selectedDshWorkspaceId ?? workspace?.id
-  const canvasControls = state.mode === 'canvas' && (threads.length > 0 || state.draft?.kind === 'new') ? `<div class="canvas-controls"><button data-action="layout" title="整理节点" aria-label="整理节点"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/></svg>整理</button><button data-action="focus-active" title="定位到当前会话" aria-label="定位到当前会话"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.5v2.6M8 11.9v2.6M1.5 8h2.6M11.9 8h2.6"/></svg>定位</button><button data-action="zoom-out" aria-label="缩小" title="缩小"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3.5 8h9"/></svg></button><span>${Math.round(state.zoom * 100)}%</span><button data-action="zoom-in" aria-label="放大" title="放大"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M8 3.5v9M3.5 8h9"/></svg></button></div>` : ''
+  const canvasControls = state.mode === 'canvas' && (threads.length > 0 || state.draft?.kind === 'new') ? `<div class="canvas-controls">${canvasScopeControls(threads)}<button data-action="layout" title="整理节点" aria-label="整理节点"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/></svg>整理</button><button data-action="focus-active" title="定位到当前会话" aria-label="定位到当前会话"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.5v2.6M8 11.9v2.6M1.5 8h2.6M11.9 8h2.6"/></svg>定位</button><button data-action="zoom-out" aria-label="缩小" title="缩小"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3.5 8h9"/></svg></button><span class="canvas-zoom-label">${Math.round(state.zoom * 100)}%</span><button data-action="zoom-in" aria-label="放大" title="放大"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M8 3.5v9M3.5 8h9"/></svg></button></div>` : ''
   const detailAvailable = currentThread() !== null
   const canvasTabs = `<nav class="canvas-tabs" aria-label="会话地图视图"><button class="${state.mode === 'canvas' ? 'active' : ''}" data-action="show-canvas">地图</button><button class="${state.mode === 'thread' ? 'active' : ''}" data-action="show-thread" data-thread="${state.activeId ?? ''}" ${detailAvailable ? '' : 'disabled'}>详情</button></nav>`
   morphInto(app, `<main class="synapse-shell ${state.sidebarCollapsed ? 'sidebar-collapsed' : ''}"><aside class="sidebar"><div class="sidebar-brand-row"><div class="brand" aria-label="Synapse"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 32 32" fill="none"><path d="M9 10.5 16 7l7 3.5M9 10.5v8L16 22m0-15v15m7-11.5v8L16 22"/><circle cx="9" cy="10" r="2.5"/><circle cx="23" cy="10" r="2.5"/><circle cx="16" cy="23" r="2.5"/></svg><strong>Synapse</strong></div><button class="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-label="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}" title="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.25"/><path d="M6 2v12"/></svg></button></div><button class="new-workspace" type="button" data-action="create-session" ${state.draft !== null ? 'disabled' : ''}><svg class="new-session-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v6.5M4.75 8h6.5"/></svg><span>新会话</span></button><label class="workspace-label"><span>工作区</span><span class="workspace-select"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 4.75h3l1.2 1.5h6.8v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"/></svg><select data-action="select-workspace" aria-label="选择工作区" ${state.draft !== null ? 'disabled' : ''}>${choices.map(item => `<option value="${item.id}" title="${escapeHtml(item.path ?? item.title)}" ${item.id === selectedWorkspaceId ? 'selected' : ''}>${escapeHtml(item.title)}</option>`).join('')}</select></span></label><div class="sidebar-heading"><span>会话</span></div><nav class="thread-tree">${threads.map(thread => `<button class="tree-row ${thread.id === state.activeId ? 'active' : ''}" data-action="select-thread" data-thread="${thread.id}" style="--thread-color:#374151"><span class="tree-dot"></span><span>${escapeHtml(threadListTitle(thread))}</span>${thread.parentId === null ? '' : '<i>分支</i>'}</button>`).join('') || '<p class="tree-empty">暂未同步会话</p>'}</nav></aside><header class="topbar">${canvasControls}</header><section class="main-stage">${state.error ? `<div class="status-message" role="alert"><span>${escapeHtml(state.error)}</span><button data-action="dismiss-error" aria-label="关闭" title="关闭">×</button></div>` : ''}${canvasTabs}${view}${selectionFollowupButton()}</section></main>`)
@@ -1816,7 +1859,7 @@ function render() {
   // center it on the focused card once the canvas DOM is mounted.
   if (state.canvasNeedsCenter) {
     state.canvasNeedsCenter = false
-    window.requestAnimationFrame(() => { if (state.mode === 'canvas') focusActiveCard() })
+    queueActiveCardFocus()
   }
   for (const [cardId, scrollTop] of cardScrollTops) {
     const answer = app.querySelector(`.thread-card[data-card-id="${CSS.escape(cardId)}"] .thread-answer`)
@@ -1887,7 +1930,7 @@ function hydrateBodies() {
   }
   const viewKey = state.mode === 'thread'
     ? `thread:${state.activeId}:${currentThread() === null ? 0 : detailPage(currentThread()).start}`
-    : `canvas:${state.inspectorCardId ?? ''}`
+    : `canvas:${state.focusedThreadId ?? ''}:${state.inspectorCardId ?? ''}`
   bodyLoader.sync(wanted, viewKey)
 }
 
@@ -2179,7 +2222,7 @@ function zoomCanvas(viewport, nextZoom, clientX, clientY) {
     applyCanvasTransform()
     syncCanvasViewport()
   }
-  const label = document.querySelector('.canvas-controls span')
+  const label = document.querySelector('.canvas-zoom-label')
   if (label !== null) label.textContent = `${Math.round(state.zoom * 100)}%`
 }
 
@@ -2188,6 +2231,46 @@ function zoomCanvasAtCenter(delta) {
   if (!(viewport instanceof HTMLElement)) return
   const bounds = viewport.getBoundingClientRect()
   zoomCanvas(viewport, state.zoom + delta, bounds.left + bounds.width / 2, bounds.top + bounds.height / 2)
+}
+
+function setCanvasFocus(threadId) {
+  if (threadId === state.focusedThreadId) return false
+  if (threadId !== null && !visibleThreads(state.workspace?.threads ?? []).some(thread => thread.id === threadId)) return false
+  // Both scopes share the current camera and zoom. Switching only changes
+  // visibility; invalidate queued centering from earlier navigation as well.
+  state.focusedThreadId = threadId
+  state.canvasFocusRevision++
+  state.canvasNeedsCenter = false
+  state.selectedCardId = null
+  state.inspectorCardId = null
+  state.inspectorOpening = false
+  cancelRegionWork()
+  regionView = null
+  bodyLoader.pause()
+  invalidateCanvasGraph()
+  return true
+}
+
+function reconcileCanvasFocus(threads, switched = false) {
+  if (switched) {
+    // A different workspace starts in its own all-conversation view.
+    state.focusedThreadId = null
+    state.canvasFocusRevision++
+    state.canvasNeedsCenter = false
+  } else if (state.focusedThreadId !== null && state.focusedThreadId !== undefined
+    && !threads.some(thread => thread.id === state.focusedThreadId)) {
+    setCanvasFocus(null)
+  }
+}
+
+function queueActiveCardFocus() {
+  const revision = state.canvasFocusRevision
+  const workspaceId = state.workspace?.id
+  const activeId = state.activeId
+  window.requestAnimationFrame(() => {
+    if (state.mode === 'canvas' && state.canvasFocusRevision === revision
+      && state.workspace?.id === workspaceId && state.activeId === activeId) focusActiveCard()
+  })
 }
 
 function focusActiveCard() {
@@ -2411,22 +2494,27 @@ app.addEventListener('click', async event => {
     if (button.dataset.action === 'create-session') openNewSession()
     if (button.dataset.action === 'open-current' && state.currentDsh !== null) post('synapse:open-session', { sessionId: state.currentDsh.id })
     if (button.dataset.action === 'select-thread' && thread !== undefined) {
+      if (state.focusedThreadId !== null && state.draft !== null) return setError('请先完成或取消正在编辑的追问或分支')
       state.mapCardSessionSwitches.clear()
       state.activeId = thread.id
       state.selectedCardId = null
       state.inspectorCardId = null
       state.inspectorOpening = false
       state.error = ''
-      if (state.workspace !== null) revealConversationThread(conversationCards(state.workspace.threads), thread.id)
+      if (state.focusedThreadId !== null) setCanvasFocus(thread.id)
+      else if (state.workspace !== null) revealConversationThread(conversationCards(state.workspace.threads), thread.id)
       render()
       // The state switch is instant, so the map has to show it: without this the
       // camera stayed on the previous conversation's cards (often thousands of
       // pixels away), and a click that worked looked like a dead button.
-      window.requestAnimationFrame(() => { if (state.mode === 'canvas') focusActiveCard() })
+      queueActiveCardFocus()
       void loadThreadHistory(thread)
       // Bidirectional current-session sync: switch DSH's current session
       // without closing the map; the client confirms via synapse:current-session.
-      if (thread.dshSessionId !== null) post('synapse:activate-session', { sessionId: thread.dshSessionId })
+      if (thread.dshSessionId !== null) {
+        if (thread.dshSessionId !== state.currentDsh?.id) state.mapCardSessionSwitches.add(thread.dshSessionId)
+        post('synapse:activate-session', { sessionId: thread.dshSessionId })
+      }
     }
     if (button.dataset.action === 'detail-prev' && thread !== undefined) changeDetailPage(thread, -1)
     if (button.dataset.action === 'detail-next' && thread !== undefined) changeDetailPage(thread, 1)
@@ -2438,14 +2526,12 @@ app.addEventListener('click', async event => {
       if (collapsing && state.workspace !== null) {
         const allCards = conversationCards(state.workspace.threads)
         const nextCollapsed = new Set(state.collapsedCardIds).add(cardId)
-        const visibleCards = conversationGraphView(allCards, nextCollapsed).cards
+        const visibleCards = conversationGraphView(scopedConversationCards(allCards, visibleThreads(state.workspace.threads)), nextCollapsed).cards
         const visibleIds = new Set(visibleCards.map(card => card.id))
         const draftParentId = draftPlacement(allCards)?.parent.id
         if (draftParentId !== undefined && !visibleIds.has(draftParentId)) return setError('请先完成或取消正在编辑的追问或分支')
-        // Collapsing is a view operation, so it is never refused: it used to be
-        // blocked whenever the active conversation would be hidden, which made
-        // "−" look dead on exactly the newest card people press it on. Keep the
-        // camera useful instead, by re-focusing after the collapse below.
+        // The active session may be hidden too; only an unfinished draft
+        // requires its source card to remain visible.
       }
       collapsing ? state.collapsedCardIds.add(cardId) : state.collapsedCardIds.delete(cardId)
       persistCollapsedCards()
@@ -2469,6 +2555,11 @@ app.addEventListener('click', async event => {
     if (button.dataset.action === 'zoom-in') zoomCanvasAtCenter(.1)
     if (button.dataset.action === 'zoom-out') zoomCanvasAtCenter(-.1)
     if (button.dataset.action === 'focus-active') focusActiveCard()
+    if (button.dataset.action === 'focus-thread' || button.dataset.action === 'show-workspace') {
+      if (state.draft !== null) return setError('请先完成或取消正在编辑的追问或分支')
+      if (button.dataset.action === 'focus-thread' && state.focusedThreadId !== null) return
+      if (setCanvasFocus(button.dataset.action === 'show-workspace' ? null : state.activeId)) render()
+    }
     if (button.dataset.action === 'dismiss-error') { state.error = ''; render() }
     if (button.dataset.action === 'layout' && state.workspace !== null) {
       resetCardPositions()
@@ -2572,7 +2663,10 @@ window.addEventListener('message', event => {
         state.inspectorCardId = null
         state.inspectorOpening = false
       }
-      if (state.workspace !== null) revealConversationThread(conversationCards(state.workspace.threads), thread.id)
+      if (state.focusedThreadId !== null) {
+        const scope = conversationThreadScope(visibleThreads(state.workspace?.threads ?? []), state.focusedThreadId)
+        if (!preserveCanvasCamera && state.draft === null && !scope.has(thread.id)) setCanvasFocus(thread.id)
+      } else if (state.workspace !== null) revealConversationThread(conversationCards(state.workspace.threads), thread.id)
     }
     if (previousId !== data.session?.id) {
       // A real session switch: re-center on the new session's latest turn,

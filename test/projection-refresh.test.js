@@ -41,7 +41,7 @@ function harness() {
     document: { hidden: false, activeElement: null, baseURI: 'http://local/synapse/' },
     window: { requestAnimationFrame() {} },
     state: {
-      summaries: [], workspace: null, activeId: null, currentDsh: null,
+      summaries: [], workspace: null, activeId: null, currentDsh: null, focusedThreadId: null,
       dshWorkspaces: groups, selectedDshWorkspaceId: null,
       draft: null, dragging: false, canvasGesture: false, canvasRefreshAfter: 0,
       workspaceLoad: 0, workspaceLoadBusy: false, workspaceLoadOwner: null,
@@ -57,6 +57,7 @@ function harness() {
     },
     render() { renders += 1 },
     resetCanvasCamera() { cameraResets += 1 },
+    queueActiveCardFocus() {},
     loadThreadHistory: async () => {},
     revealConversationThread() {},
     conversationCards: threads => threads,

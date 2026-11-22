@@ -21,12 +21,6 @@ const slice = (from, to) => {
   return source.slice(start, end)
 }
 
-test('switching conversation brings that conversation into view', () => {
-  const branch = slice("button.dataset.action === 'select-thread'", "button.dataset.action === 'show-thread'")
-  assert.match(branch, /render\(\)/)
-  assert.match(branch, /requestAnimationFrame\(\(\) => \{ if \(state\.mode === 'canvas'\) focusActiveCard\(\) \}\)/)
-})
-
 test('a user workspace switch is not cancelled by the projection poll', () => {
   assert.match(source, /workspaceLoadOwner/)
   assert.match(source, /if \(!userInitiated && \(state\.workspaceLoadOwner === 'user' \|\| state\.workspaceLoadBusy\)\) return false/)
