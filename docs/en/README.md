@@ -144,6 +144,12 @@ Settings at the bottom of the sidebar provide wheel behavior, zoom speed, send s
 
 ## Recent changes
 
+**0.5.10 · 2026-11-23**
+
+- Removed the outline around the canvas when it receives focus.
+- Extended the reading panel to the canvas bottom. Opening it moves locate and zoom controls to its left; closing it restores their bottom-right position.
+- Adapted the narrow reading panel to the actual canvas width, preventing overlapping controls while preserving the camera, zoom, and card positions.
+
 **0.5.9 · 2026-11-23**
 
 - Reorganized canvas controls and added action and zoom menus with consistent theme styling.
