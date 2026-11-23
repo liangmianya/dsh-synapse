@@ -348,6 +348,7 @@ async function loadBridge(options = {}) {
     // Flip the Host-reported running bit the list row carries.
     setRunning: (id, running) => { rows.set(id, { ...rows.get(id), running }) },
     message: data => windowListeners.get('message')?.({ origin: ORIGIN, data: { source: 'dsh-synapse', ...data } }),
+    keydown: event => windowListeners.get('keydown')?.(event),
     shell: () => shell,
     switchElement: () => shell.querySelector('.dsh-synapse-switch'),
     stalePill: () => stalePill,
@@ -425,6 +426,22 @@ test('activates a session through the Workspace UI without closing the map', asy
 
   assert.deepEqual(bridge.calls.opened, ['session-target'])
   assert.equal(bridge.overlay().hidden, false)
+})
+
+test('host Escape delegates to the map and preserves the visible overlay', async () => {
+  const bridge = await loadBridge()
+  let prevented = 0
+  const event = { key: 'Escape', preventDefault() { prevented++ } }
+  bridge.keydown(event)
+  assert.equal(prevented, 0)
+  bridge.message({ type: 'synapse:map-ready' })
+  bridge.keydown(event)
+  assert.equal(prevented, 1)
+  assert.equal(bridge.postedOf('synapse:escape').length, 1)
+  assert.equal(bridge.overlay().hidden, false)
+  bridge.keydown({ ...event, isComposing: true })
+  bridge.keydown({ ...event, defaultPrevented: true })
+  assert.equal(bridge.postedOf('synapse:escape').length, 1)
 })
 
 test('opens a session and closes the map without a controller-level open call', async () => {

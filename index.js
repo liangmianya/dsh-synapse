@@ -2,12 +2,20 @@ import { copyFile, mkdir, readFile, rename, stat, unlink, writeFile } from 'node
 import { randomUUID } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import { dirname, join } from 'node:path'
+import packageMetadata from './package.json' with { type: 'json' }
 import { BODY_LIMITS, LogLimitError, SessionLogReader, bodiesFromEvents, bodyPage, bodySelection, previewBody } from './session-bodies.js'
 export { SessionLogReader, bodiesFromEvents, decodeSessionLog } from './session-bodies.js'
 
 export const name = 'synapse'
 export const inject = ['webServer', 'sessions']
 
+// Capture the identity when this backend is loaded. Reading package.json on
+// each request would mislabel a running host after an on-disk plugin update.
+const PLUGIN_INFO = Object.freeze({
+  name: packageMetadata.name,
+  version: packageMetadata.version,
+  build: packageMetadata.synapseBuild ?? 'release',
+})
 const MAX_BODY_BYTES = 32 * 1024
 const MAX_TITLE_LENGTH = 120
 const MAX_NOTE_LENGTH = 4_000
@@ -631,7 +639,7 @@ export class WorkspaceStore {
       kind: projection.kind,
       sourceSeq: event.seq,
       at,
-      ...(projection.kind === 'user' && typeof event.data?.source?.kind === 'string' ? { sourceKind: event.data.source.kind } : {}),
+      ...(projection.kind === 'user' ? userSourceMetadata(event.data?.source) : {}),
       ...(projection.kind === 'assistant' || projection.kind === 'error'
         ? { turn: event.data?.turn, step: event.data?.step, process: [] }
         : {}),
@@ -738,6 +746,16 @@ function normalizeState(value) {
         if (Array.isArray(thread.messages)) {
           const messages = thread.messages.filter(message => !(message.kind === 'user' && isInjectedUserSource(message.source ?? { kind: message.sourceKind })))
           if (messages.length !== thread.messages.length) migrated = true
+          // An older plugin can append unverified rows after a successful v2
+          // repair, while leaving its completion marker intact. Invalidate
+          // that marker once at load, not on the live event projection path.
+          // Local notes have no source seq; verified source-less imports are
+          // also retained without triggering another full-log scan.
+          if (typeof thread.dshSessionId === 'string' && thread.projectionVersion === PROJECTION_VERSION
+            && messages.some(isUnverifiedUserMessage)) {
+            migrated = true
+            return { ...thread, messages, projectionVersion: null }
+          }
           return { ...thread, messages }
         }
         migrated = true
@@ -976,6 +994,17 @@ function isInjectedUserSource(source) {
   return typeof source?.kind === 'string' && source.kind !== 'user'
 }
 
+/** Missing provenance is valid in old imports once matched to a committed event. */
+function userSourceMetadata(source) {
+  return typeof source?.kind === 'string' ? { sourceKind: source.kind } : { sourceVerified: true }
+}
+
+/** An indexed user row whose provenance has not been checked against its event. */
+function isUnverifiedUserMessage(message) {
+  return message?.kind === 'user' && Number.isSafeInteger(message.sourceSeq)
+    && typeof message.sourceKind !== 'string' && message.sourceVerified !== true
+}
+
 function contentText(content) {
   if (!Array.isArray(content)) return ''
   return content.filter(block => block?.type === 'text').map(block => block.text)
@@ -990,7 +1019,7 @@ function sameProcess(a, b) {
 }
 
 function sameProjection(a, b) {
-  return b && ['id', 'text', 'length', 'truncated', 'kind', 'sourceSeq', 'sourceKind', 'at', 'turn', 'step'].every(key => a[key] === b[key])
+  return b && ['id', 'text', 'length', 'truncated', 'kind', 'sourceSeq', 'sourceKind', 'sourceVerified', 'at', 'turn', 'step'].every(key => a[key] === b[key])
     && sameProcess(a.process ?? [], b.process ?? [])
 }
 
@@ -1131,6 +1160,7 @@ export function apply(ctx, config) {
       const hostname = (typeof req.headers.host === 'string' ? req.headers.host : '').replace(/:\d+$/, '').toLowerCase()
       if (!trustedHosts.has(hostname)) return sendJson(res, 403, { error: '不被信任的 Host' })
       const path = new URL(req.url ?? '/', 'http://dsh.local').pathname
+      if (path === '/synapse/api/info' && req.method === 'GET') return sendJson(res, 200, PLUGIN_INFO)
       if (path === '/synapse/api/reset' && req.method === 'POST') return sendJson(res, 200, await store.clearLegacy(ctx.sessions.list()))
       if (path === '/synapse/api/workspaces') {
         if (req.method === 'GET') return sendJson(res, 200, { workspaces: await store.list() })

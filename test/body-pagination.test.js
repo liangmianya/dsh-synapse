@@ -31,7 +31,7 @@ function harness(count = 95) {
     },
     messagesFor: value => value.messages,
     currentThread() { return context.state.workspace.threads.find(value => value.id === context.state.activeId) },
-    canReplaceView: () => true, deferCanvasRefresh() {},
+    canReplaceView: () => true, deferCanvasRefresh() {}, cancelCanvasZoom() {}, resetCanvasInteraction() {},
     api: async path => { requests.push(path); return responder(path) },
     render() { renders += 1 },
     renderCanvas: () => '', questionFor: () => '会话标题', escapeHtml: value => value,

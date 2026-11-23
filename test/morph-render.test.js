@@ -5,7 +5,7 @@ import vm from 'node:vm'
 
 const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
 const start = source.indexOf('const MORPH_KEY_ATTRIBUTES =')
-const end = source.indexOf('const boundDragHandles =', start)
+const end = source.indexOf('const DRAG_THRESHOLD =', start)
 assert.ok(start >= 0 && end > start, 'missing DOM reconciliation source')
 
 // A small DOM double lets these tests check node identity and edited content

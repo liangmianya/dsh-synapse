@@ -1,7 +1,7 @@
 import { createReadStream } from 'node:fs'
 import { readdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { constants, zstdDecompress, zstdDecompressSync } from 'node:zlib'
+import { constants, createZstdDecompress, zstdDecompress, zstdDecompressSync } from 'node:zlib'
 import { promisify } from 'node:util'
 
 const KiB = 1024
@@ -329,34 +329,50 @@ export class SessionLogReader {
       }
       const compressed = Buffer.concat(chunks, size)
       chunks.length = 0
-      let tail = Buffer.alloc(0)
+      let lineParts = []
+      let lineBytes = 0
       let decodedBytes = 0
-      const consume = line => {
-        if (line.length > this.limits.lineBytes) throw new LogLimitError('单行内容')
-        if (line.length === 0) return
-        const event = JSON.parse(line.toString('utf8'))
-        if (Number.isSafeInteger(event?.seq)) visit(event)
+      const append = part => {
+        lineBytes += part.length
+        if (lineBytes > this.limits.lineBytes) throw new LogLimitError('单行内容')
+        if (part.length > 0) lineParts.push(part)
       }
-      const frames = sessionFrames(compressed, this.limits)
+      const consume = () => {
+        if (lineBytes > 0) {
+          const line = lineParts.length === 1 ? lineParts[0] : Buffer.concat(lineParts, lineBytes)
+          const event = JSON.parse(line.toString('utf8'))
+          if (Number.isSafeInteger(event?.seq)) visit(event)
+        }
+        lineParts = []
+        lineBytes = 0
+      }
+      // Restored forks can pack their inherited history into one frame larger
+      // than the body reader's allocation cap. Streaming scans only retain one
+      // bounded JSON line, so their frame cap can use the total decoded budget.
+      // Body reads and the synchronous export still enforce frameBytes.
+      const frames = sessionFrames(compressed, { ...this.limits, frameBytes: this.limits.decodedBytes })
       let next
       while (!(next = frames.next()).done) {
-        const frame = next.value
-        if (decodedBytes >= this.limits.decodedBytes) throw new LogLimitError('总解压')
-        let decoded
-        try { decoded = await decompress(frame, decodeOptions(Math.min(this.limits.frameBytes, this.limits.decodedBytes - decodedBytes))) }
-        catch (error) { decodeError(error) }
-        decodedBytes += decoded.length
-        const data = tail.length ? Buffer.concat([tail, decoded]) : decoded
-        let start = 0
-        for (let end = data.indexOf(10); end !== -1; end = data.indexOf(10, start)) {
-          consume(data.subarray(start, end))
-          start = end + 1
+        const decoder = createZstdDecompress({ chunkSize: 64 * KiB, params: { [constants.ZSTD_d_windowLogMax]: 25 } })
+        try {
+          decoder.end(next.value)
+          for await (const chunk of decoder) {
+            decodedBytes += chunk.length
+            if (decodedBytes > this.limits.decodedBytes) throw new LogLimitError('总解压')
+            let start = 0
+            for (let end = chunk.indexOf(10); end !== -1; end = chunk.indexOf(10, start)) {
+              append(chunk.subarray(start, end))
+              consume()
+              start = end + 1
+            }
+            append(chunk.subarray(start))
+          }
+        } finally {
+          decoder.destroy()
         }
-        if (data.length - start > this.limits.lineBytes) throw new LogLimitError('单行内容')
-        tail = Buffer.from(data.subarray(start))
       }
       if (next.value !== true || decodedBytes === 0) return false
-      consume(tail)
+      consume()
       return true
     } finally {
       const next = this.waiters.shift()

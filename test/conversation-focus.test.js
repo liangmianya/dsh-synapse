@@ -69,7 +69,9 @@ function harness(threads = [thread('other'), thread('root'), thread('child', 'ro
     bodyLoader: { pause() {}, retainThreads() {}, sync: (wanted, key) => bodyRequests.push({ wanted, key }) },
     bodyRevision: () => 'revision',
     markdownCache: { clear() {} },
-    applyCanvasTransform() {}, syncCanvasViewport() {}, clearViewCaches() {},
+    applyCanvasTransform() {}, syncCanvasViewport() {}, clearViewCaches() {}, cancelCanvasZoom() {}, resetCanvasInteraction() {},
+    syncCanvasZoomLabel() {}, canvasTool: 'select', activeCanvasMenu: null,
+    canvasViewport: () => null,
     canReplaceView: () => true,
     currentDshThread() { return context.state.workspace.threads.find(value => value.dshSessionId === context.state.currentDsh?.id) },
     openCurrentWorkspace: async () => false,
@@ -95,6 +97,7 @@ function harness(threads = [thread('other'), thread('root'), thread('child', 'ro
     snippet('function draftPlacement(', 'function draftCard('),
     snippet('let canvasGraphRevision =', 'function canvasWorldBounds('),
     snippet('function canvasScopeControls(', 'function isProcessMessage('),
+    snippet('function performCanvasAction(', 'function openCanvasMenu('),
     snippet('function setCanvasFocus(', 'let selectionFollowup ='),
     snippet('function pruneWorkspaceCaches(', 'function pauseMapBodies('),
     snippet('function hydrateBodies()', 'function refreshLoadedBodies('),
@@ -119,6 +122,33 @@ function harness(threads = [thread('other'), thread('root'), thread('child', 'ro
 }
 const ids = h => Array.from(h.state.canvasCards, card => card.dshThreadId)
 const indexCards = h => Array.from(vm.runInContext('canvasGraphCache.index.query({ left: -10000, right: 10000, top: -10000, bottom: 10000 })', h.context))
+
+test('fit includes unmounted scope cards; fitting or centering selection preserves card positions', () => {
+  const h = harness()
+  h.state.canvasCards = [
+    { id: 'near', dshThreadId: 'root', position: { x: 0, y: 0 } },
+    { id: 'far', dshThreadId: 'root', position: { x: 1800, y: 1000 } },
+  ]
+  const positions = plain(h.state.canvasCards)
+  h.context.fitCanvasCards()
+  assert.ok(h.state.zoom < .5)
+  for (const card of h.state.canvasCards) {
+    const x = h.state.canvasCamera.x + card.position.x * h.state.zoom
+    const y = h.state.canvasCamera.y + card.position.y * h.state.zoom
+    assert.ok(x >= 48 - 1e-9 && x + 310 * h.state.zoom <= 952 + 1e-9)
+    assert.ok(y >= 48 - 1e-9 && y + 276 * h.state.zoom <= 652 + 1e-9)
+  }
+  h.state.selectedCardId = 'near'
+  h.context.fitCanvasCards(true)
+  assert.ok(h.state.zoom > 1)
+  assert.equal(h.state.canvasCamera.x, 500 - 155 * h.state.zoom)
+  const zoom = h.state.zoom
+  h.state.selectedCardId = 'far'
+  h.context.focusActiveCard({ preferSelection: true })
+  assert.equal(h.state.zoom, zoom)
+  assert.equal(h.state.canvasCamera.x, 500 - 1955 * zoom)
+  assert.deepEqual(plain(h.state.canvasCards), positions)
+})
 
 test('focus includes every turn and nested forks without moving cards or filtering the sidebar list', async () => {
   const h = harness()

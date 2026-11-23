@@ -7,7 +7,7 @@ import { zstdCompressSync } from 'node:zlib'
 import test from 'node:test'
 import vm from 'node:vm'
 import { apply, WorkspaceStore } from '../index.js'
-import { bodiesFromEvents, SessionLogReader } from '../session-bodies.js'
+import { bodiesFromEvents, LOG_LIMITS, SessionLogReader } from '../session-bodies.js'
 
 const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
 const cacheSource = await readFile(new URL('../browser-cache.js', import.meta.url), 'utf8')
@@ -124,6 +124,62 @@ test('new projection counts only real user turns, including source-less imports 
   assert.equal(thread.messages.find(message => message.sourceSeq === 51).text, '')
 })
 
+test('first installation imports existing sessions and forks, then keeps live turns correct across restart', async t => {
+  const f = await fixture(t)
+  await rm(f.dataFile)
+  const store = new WorkspaceStore(f.dataFile)
+  f.stores.push(store)
+  const raw = [...events(),
+    user(60, '[model changed: old model; continuing with another model]', 'model-selection'),
+    user(61, 'The approval policy changed from "ask" to "never".', 'user-approval'),
+    user(62, '新类型的系统提示', 'future-injection'),
+    user(63, '[model changed: 用户自己引用的内容]', 'user'),
+    assistant(64, 7, [textBlock('引用内容的回答')]),
+    user(65, 'Time sampled while preparing: 合法的无来源导入提问'),
+    assistant(66, 8, [textBlock('导入内容的回答')])]
+  const childRaw = [...raw, user(90, '分支问题', 'user'),
+    user(91, 'Time sampled while preparing fork', 'time-context'),
+    assistant(92, 9, [textBlock('分支回答')])]
+  const parent = { id: 'parent', title: '已有会话', header: { cwd: 'C:\\test' },
+    inheritedEventCount: 0, snapshotEvents: () => raw }
+  const child = { id: 'child', title: '已有分支', header: { cwd: 'C:\\test', parentSession: 'parent' },
+    inheritedEventCount: 90, snapshotEvents: () => childRaw }
+  // A fresh install has no Synapse data. DSH may restore children first.
+  await store.projectSession(child, child.inheritedEventCount)
+  await store.projectSession(parent)
+  await store.syncSessions([{ id: 'parent', cwd: 'C:\\test', title: parent.title },
+    { id: 'child', cwd: 'C:\\test', title: child.title, parentId: 'parent' }])
+  const threads = await store.threadsForSessions(['parent', 'child'])
+  const parentThread = threads.find(thread => thread.dshSessionId === 'parent')
+  const childThread = threads.find(thread => thread.dshSessionId === 'child')
+  const cards = canvas().cards([parentThread, childThread])
+  assert.deepEqual(Array.from(cards, card => card.question), ['真实问题', '[model changed: 用户自己引用的内容]',
+    'Time sampled while preparing: 合法的无来源导入提问', '分支问题'])
+  assert.equal(cards[0].answer.text, '最终回答')
+  assert.equal(cards[0].processCount, 5)
+  assert.equal(childThread.parentId, parentThread.id)
+  assert.equal(childThread.messages[0].sourceSeq, 90)
+  assert.equal(parentThread.messages.find(message => message.sourceSeq === 65).sourceVerified, true)
+  const live = [user(80, '安装后的新问题', 'user'),
+    user(81, '审批策略变化', 'user-approval'), assistant(82, 10, [textBlock('新问题的回答')])]
+  await store.projectEvents(parent, live)
+  raw.push(...live)
+  await store.flush()
+  const before = await readFile(f.dataFile, 'utf8')
+  const reopened = new WorkspaceStore(f.dataFile)
+  f.stores.push(reopened)
+  await reopened.repairStoredSessions({ scan() { throw new Error('fresh imports must not require legacy repair') } })
+  assert.equal(await reopened.projectSession(parent), null)
+  assert.equal(await reopened.projectSession(child, child.inheritedEventCount), null)
+  await reopened.flush()
+  assert.equal(await readFile(f.dataFile, 'utf8'), before)
+  const [updated] = await reopened.threadsForSessions(['parent'])
+  const updatedCards = canvas().cards([updated])
+  assert.equal(updatedCards.length, 4)
+  assert.equal(updatedCards.at(-1).question, '安装后的新问题')
+  assert.equal(updatedCards.at(-1).answer.text, '新问题的回答')
+})
+
 test('old five-card index becomes one real turn, retaining IDs, tools, metadata and saved card position', async t => {
   const f = await fixture(t)
   const raw = events()
@@ -180,6 +236,75 @@ test('missing logs and unmatched sequences survive; an available log can repair 
   assert.ok(thread.messages.some(message => message.id === 'note'))
 })
 
+test('completed v2 projections are repaired again when older code appended unverified notices', async t => {
+  const raw = [...events(),
+    user(60, '[model changed: previous model; continuing with another model]', 'model-selection'),
+    user(61, 'The approval policy changed from "ask" to "never" (changed by the user).', 'user-approval')]
+  const old = { ...oldThread(raw), projectionVersion: 2, sourceSeedLength: 0 }
+  const f = await fixture(t, [old])
+  assert.equal((await f.get()).projectionVersion, null)
+  await f.put('session-old', raw)
+  await f.store.repairStoredSessions(f.reader)
+  const thread = await f.get()
+  assert.equal(thread.projectionVersion, 2)
+  assert.equal(canvas().cards([thread]).length, 1)
+  assert.equal(canvas().cards([thread])[0].answer.text, '最终回答')
+  assert.equal(canvas().cards([thread])[0].processCount, 5)
+  assert.equal(thread.messages[0].id, 'old-9')
+  for (const key of ['id', 'title', 'dshSessionTitle', 'parentId', 'sourceSeedLength', 'position', 'color', 'createdAt']) assert.deepEqual(thread[key], old[key])
+  await f.store.flush()
+  // Simulate an old plugin reintroducing one notice without clearing v2.
+  const contaminated = JSON.parse(await readFile(f.dataFile, 'utf8'))
+  contaminated.workspaces[0].threads[0].messages.push(old.messages.find(message => message.sourceSeq === 14))
+  await writeFile(f.dataFile, JSON.stringify(contaminated))
+  const reopened = new WorkspaceStore(f.dataFile)
+  f.stores.push(reopened)
+  await reopened.repairStoredSessions(f.reader)
+  const [repaired] = await reopened.threadsForSessions(['session-old'])
+  assert.equal(repaired.projectionVersion, 2)
+  assert.equal(canvas().cards([repaired]).length, 1)
+  assert.equal(canvas().cards([repaired])[0].processCount, 5)
+})
+
+test('verified source-less imports and local notes do not rescan on the next startup', async t => {
+  const raw = [user(1, 'Time sampled while preparing: 用户引用的文本'),
+    assistant(2, 1, [textBlock('回答')]),
+    user(3, '[model changed: 用户自己引用]', 'user')]
+  const old = { ...oldThread(raw), projectionVersion: 2 }
+  old.messages.push({ id: 'note', kind: 'user', text: '本地笔记' })
+  const f = await fixture(t, [old])
+  await f.put('session-old', raw)
+  await f.store.repairStoredSessions(f.reader)
+  const thread = await f.get()
+  assert.equal(thread.messages.find(message => message.sourceSeq === 1).sourceVerified, true)
+  assert.equal(thread.messages.find(message => message.sourceSeq === 3).sourceKind, 'user')
+  assert.ok(thread.messages.some(message => message.id === 'note'))
+  assert.equal(canvas().cards([thread]).length, 3)
+  await f.store.flush()
+  const before = await readFile(f.dataFile, 'utf8')
+  const reopened = new WorkspaceStore(f.dataFile)
+  f.stores.push(reopened)
+  await reopened.repairStoredSessions({ scan() { throw new Error('verified imports and local notes must not rescan') } })
+  await reopened.flush()
+  assert.equal(await readFile(f.dataFile, 'utf8'), before)
+})
+
+test('invalidating a completed repair never removes unverified rows when its log is incomplete', async t => {
+  const old = { ...oldThread(), projectionVersion: 2 }
+  const f = await fixture(t, [old])
+  const before = await f.get()
+  assert.equal(before.projectionVersion, null)
+  await f.store.repairStoredSessions(f.reader)
+  assert.deepEqual(await f.get(), before)
+  const frame = zstdCompressSync(Buffer.from(events().map(event => JSON.stringify(event)).join('\n') + '\n'))
+  await f.put('session-old', Buffer.concat([frame, frame.subarray(0, 8)]))
+  await f.store.repairStoredSessions(f.reader)
+  assert.deepEqual(await f.get(), before)
+  await f.put('session-old', zstdCompressSync(Buffer.from(JSON.stringify(events()[0]) + '\n{invalid}\n')))
+  await assert.rejects(f.store.repairStoredSessions(f.reader), SyntaxError)
+  assert.deepEqual(await f.get(), before)
+})
+
 test('source-less imported messages and explicit user quotes are preserved when repairing old data', async t => {
   const raw = [user(1, '<system-reminder><available_skills>用户引用的内容'),
     assistant(2, 1, [textBlock('回答')]),
@@ -234,7 +359,7 @@ test('a broken session does not stop repairs of other sessions when a failure re
 
 test('fork repair excludes inherited turns and preserves the child relation', async t => {
   const raw = [user(1, '父问题', 'user'), assistant(2, 1, [textBlock('父回答')]), ...events()]
-  const old = { ...oldThread(raw), sourceSeedLength: 9, parentId: 'parent-thread', sourceParentSessionId: 'parent-session' }
+  const old = { ...oldThread(raw), projectionVersion: 2, sourceSeedLength: 9, parentId: 'parent-thread', sourceParentSessionId: 'parent-session' }
   const f = await fixture(t, [old])
   await f.put('session-old', raw)
   await f.store.repairStoredSessions(f.reader)
@@ -242,6 +367,63 @@ test('fork repair excludes inherited turns and preserves the child relation', as
   assert.equal(canvas().cards([thread]).length, 1)
   assert.equal(thread.messages[0].sourceSeq, 9)
   assert.equal(thread.parentId, 'parent-thread')
+})
+
+test('fork repair streams an inherited frame larger than the body allocation cap', async t => {
+  const inherited = Array.from({ length: 34 }, (_, seq) => ({
+    seq, time: seq + 1, type: 'session/context', data: { text: 'x'.repeat(256 * 1024) },
+  }))
+  const own = [user(40, '分支问题', 'user'),
+    user(41, 'Time sampled while preparing turn', 'time-context'),
+    user(42, '[model changed: previous model]', 'model-selection'),
+    assistant(43, 1, [textBlock('分支回答')])]
+  const old = { ...oldThread(own), projectionVersion: 2, sourceSeedLength: 40,
+    parentId: 'parent-thread', sourceParentSessionId: 'parent-session' }
+  const f = await fixture(t, [old])
+  const history = Buffer.from(inherited.map(event => JSON.stringify(event)).join('\n') + '\n')
+  assert.ok(history.length > LOG_LIMITS.frameBytes)
+  assert.ok(history.length < LOG_LIMITS.decodedBytes)
+  await f.put('session-old', Buffer.concat([zstdCompressSync(history),
+    zstdCompressSync(Buffer.from(own.map(event => JSON.stringify(event)).join('\n') + '\n'))]))
+  await f.store.repairStoredSessions(f.reader)
+  const thread = await f.get()
+  assert.equal(thread.projectionVersion, 2)
+  assert.equal(thread.parentId, old.parentId)
+  assert.equal(thread.messages[0].id, 'old-40')
+  assert.equal(canvas().cards([thread]).length, 1)
+  assert.equal(canvas().cards([thread])[0].answer.text, '分支回答')
+  assert.equal(f.reader.cacheBytes, 0)
+  assert.equal(f.reader.activeReads, 0)
+  // On-demand bodies keep the stricter allocation cap.
+  await assert.rejects(f.reader.events('session-old'), /读取上限/)
+})
+
+test('streaming repair enforces total and line budgets without committing a partial result', async t => {
+  const f = await fixture(t, [{ ...oldThread(), projectionVersion: 2 }])
+  const before = await f.get()
+  const valid = Buffer.from(events().map(event => JSON.stringify(event)).join('\n') + '\n')
+  const first = Buffer.from(JSON.stringify(events()[0]) + '\n')
+  const rest = valid.subarray(first.length)
+  const cases = [
+    [{ decodedBytes: valid.length - 1 }, zstdCompressSync(valid)],
+    [{ decodedBytes: valid.length - 1 }, Buffer.concat([zstdCompressSync(first), zstdCompressSync(rest)])],
+    [{ lineBytes: 100 }, zstdCompressSync(Buffer.from(JSON.stringify(user(1, 'x'.repeat(70_000), 'user')) + '\n'))],
+  ]
+  // A frame without a declared content size must hit the streaming byte cap.
+  const header = Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0, 0])
+  const block = Buffer.alloc(3)
+  block.writeUIntLE((first.length << 3) | 1, 0, 3)
+  cases.push([{ decodedBytes: 1024 }, Buffer.concat(Array.from({ length: 20 },
+    () => Buffer.concat([header, block, first])))])
+  for (const [limits, data] of cases) {
+    await f.put('session-old', data)
+    const reader = new SessionLogReader(f.directory, limits)
+    await assert.rejects(f.store.repairStoredSessions(reader), /读取上限/)
+    assert.deepEqual(await f.get(), before)
+    assert.equal(reader.activeReads, 0)
+    assert.equal(reader.waiters.length, 0)
+    assert.equal(reader.cacheBytes, 0)
+  }
 })
 
 test('legacy forks without a saved seed do not acquire earlier inherited questions', async t => {
@@ -271,6 +453,17 @@ test('repair scans accept split UTF-8 lines, concatenated frames and skippable t
   assert.equal(canvas().cards([thread])[0].question, '中文😀问题')
 })
 
+test('streaming scans preserve UTF-8 across output chunks and accept a final line without newline', async t => {
+  const raw = [user(1, '中😀'.repeat(12_000), 'user'), user(2, '最后一行', 'user')]
+  const f = await fixture(t, [oldThread(raw)])
+  await f.put('session-old', zstdCompressSync(Buffer.from(raw.map(event => JSON.stringify(event)).join('\n'))))
+  const visited = []
+  assert.equal(await f.reader.scan('session-old', event => visited.push(event)), true)
+  assert.deepEqual(visited, raw)
+  assert.equal(f.reader.cacheBytes, 0)
+  assert.equal(f.reader.activeReads, 0)
+})
+
 test('live replay repairs legacy rows before dedupe and does not duplicate tools on a second replay', async t => {
   const f = await fixture(t)
   const session = { id: 'session-old', header: { cwd: 'C:\\test' }, inheritedEventCount: 0, snapshotEvents: events }
@@ -282,6 +475,16 @@ test('live replay repairs legacy rows before dedupe and does not duplicate tools
   assert.equal(await f.store.projectSession(session), null)
   await f.store.flush()
   assert.equal(await readFile(f.dataFile, 'utf8'), before)
+})
+
+test('live replay repairs a completed but contaminated v2 projection before deduplication', async t => {
+  const f = await fixture(t, [{ ...oldThread(), projectionVersion: 2 }])
+  const session = { id: 'session-old', header: { cwd: 'C:\\test' }, inheritedEventCount: 0, snapshotEvents: events }
+  const thread = await f.store.projectSession(session)
+  assert.equal(thread.projectionVersion, 2)
+  assert.equal(canvas().cards([thread]).length, 1)
+  assert.equal(canvas().cards([thread])[0].processCount, 5)
+  assert.equal(await f.store.projectSession(session), null)
 })
 
 test('execution-only sessions create no turn; empty assistant steps do not settle a pending real question', () => {

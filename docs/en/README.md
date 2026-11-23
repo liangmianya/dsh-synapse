@@ -97,7 +97,7 @@ Open the top **Session Map** switch after startup. Do not run two `dsh web` proc
 3. Open **Session Map** from the top switch.
 4. Click a card or sidebar session to synchronize the current session between the map and native chat.
 5. Use **Branch** on a completed answer to preserve an alternative path.
-6. Open **Details** from a card to inspect the complete conversation.
+6. Click a card to open the reading panel; double-click its title to open the complete conversation.
 7. Use **Open in DSH** or the top **Dialogue** switch to return to native chat.
 
 The canvas supports:
@@ -125,7 +125,32 @@ The **Dialogue / Session Map** switch can be moved too:
 - With the grip focused, the arrow keys nudge it by 8px.
 - It always keeps an 8px grab margin from the viewport edges, so shrinking the window cannot strand it off screen.
 
+### Canvas tools and shortcuts
+
+The top toolbar contains the display scope and a **···** menu for automatic card layout and shortcut help. The arrow and hand tools are at the bottom left. Locate and zoom controls are at the bottom right; click the percentage to reset to 100%, fit the current scope, or fit the selected card.
+
+The wheel pans by default; Shift + wheel pans horizontally, and Ctrl (⌘ on Mac) + wheel zooms. Card text keeps native scrolling and text selection. Drag a title or handle to move a card; use Space + left drag or middle drag to pan the map.
+
+| Shortcut | Action |
+|---|---|
+| V / H | Select and read / pan |
+| + / − / 0 | Zoom / reset to 100% |
+| Shift + 1 / Shift + 2 | Fit current scope / selected card |
+| F / ? | Locate / shortcut help |
+| Esc | Cancel a gesture or animation, close menus or dialogs, blur an editor, then close the reading panel |
+| Ctrl / ⌘ + Enter | Send; Enter inserts a newline by default |
+
+Settings at the bottom of the sidebar provide wheel behavior, zoom speed, send shortcuts, reading size, themes, and editable follow-up phrases. Preferences are saved locally. Themes include follow DSH, light, dark, pastel green, pink, and blue.
+
 ## Recent changes
+
+**0.5.9 · 2026-11-23**
+
+- Reorganized canvas controls and added action and zoom menus with consistent theme styling.
+- Updated pointer and keyboard interactions, wheel and send preferences, fit commands, and shortcut help.
+- Added settings, reading sizes, three pastel themes, and editable follow-up phrases.
+- Rechecked historical system-injected prompt cards against original session logs while retaining real messages; streaming decompression supports larger inherited fork histories.
+- Coalesced smooth zoom preserves the pointer anchor; canceled drags restore positions, and closed menus release listeners.
 
 **0.5.8 · 2026-11-22**
 

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import test from 'node:test'
 import { apply, WorkspaceStore } from '../index.js'
+import packageMetadata from '../package.json' with { type: 'json' }
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'synapse-session-query-'))
@@ -51,9 +52,9 @@ test('session query API returns partial matches and retains validation and Host 
     effect: effect => effect(),
     webServer: { register(route) { if (route.path === '/synapse/api') handler = route.handler; return () => {} } },
   }, { dataFile, autoProjection: false })
-  async function request(body, { host = 'localhost:3000', method = 'POST' } = {}) {
+  async function request(body, { host = 'localhost:3000', method = 'POST', url = '/synapse/api/threads/query' } = {}) {
     const req = Readable.from([Buffer.from(JSON.stringify(body))])
-    Object.assign(req, { headers: { host }, method, url: '/synapse/api/threads/query' })
+    Object.assign(req, { headers: { host }, method, url })
     let status
     let result
     await handler(req, { writeHead(code) { status = code }, end(value) { result = JSON.parse(value) } })
@@ -69,4 +70,20 @@ test('session query API returns partial matches and retains validation and Host 
   assert.equal((await request({ sessionIds: ['child'] }, { host: 'untrusted.example' })).status, 403)
   assert.equal((await request({ sessionIds: [] }, { method: 'GET' })).status, 404)
   assert.equal((await request({ sessionIds: ['x'.repeat(33 * 1024)] })).status, 400)
+  const infoRequest = options => request({}, { method: 'GET', url: '/synapse/api/info', ...options })
+  const before = await readFile(dataFile, 'utf8')
+  const info = await infoRequest()
+  assert.equal(info.status, 200)
+  assert.deepEqual(info.body, {
+    name: packageMetadata.name, version: packageMetadata.version,
+    build: packageMetadata.synapseBuild ?? 'release',
+  })
+  const loadedVersion = packageMetadata.version
+  try {
+    packageMetadata.version = '999.0.0'
+    assert.deepEqual((await infoRequest()).body, info.body, 'loaded identity cannot change with the package metadata')
+  } finally { packageMetadata.version = loadedVersion }
+  assert.equal((await infoRequest({ host: 'untrusted.example' })).status, 403)
+  assert.equal((await infoRequest({ method: 'POST' })).status, 404)
+  assert.equal(await readFile(dataFile, 'utf8'), before)
 })

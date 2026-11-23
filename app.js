@@ -4,7 +4,53 @@ const LEGACY_CARD_POSITIONS_KEY = 'dsh-synapse:card-positions'
 const CARD_POSITIONS_KEY = 'dsh-synapse:card-positions:v3'
 const COLLAPSED_CARDS_KEY = 'dsh-synapse:collapsed-cards:v1'
 const QUICK_PHRASES_KEY = 'dsh-synapse:quick-phrases:v1'
-const DEFAULT_QUICK_PHRASES = ['展开说明', '举例', '通俗易懂', '对比解释']
+const PREFERENCES_KEY = 'dsh-synapse:preferences:v1'
+const DEFAULT_PREFERENCES = Object.freeze({ zoomSpeed: 'standard', wheelBehavior: 'pan', sendShortcut: 'modifier-enter', readingSize: 'standard', theme: 'host' })
+const ZOOM_SPEED_FACTORS = Object.freeze({ slow: .6, standard: 1, fast: 1.6 })
+function normalizePreferences(value) {
+  const input = value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  return {
+    zoomSpeed: ['slow', 'standard', 'fast'].includes(input.zoomSpeed) ? input.zoomSpeed : DEFAULT_PREFERENCES.zoomSpeed,
+    wheelBehavior: ['pan', 'zoom'].includes(input.wheelBehavior) ? input.wheelBehavior : DEFAULT_PREFERENCES.wheelBehavior,
+    sendShortcut: ['modifier-enter', 'enter'].includes(input.sendShortcut) ? input.sendShortcut : DEFAULT_PREFERENCES.sendShortcut,
+    readingSize: ['standard', 'large'].includes(input.readingSize) ? input.readingSize : DEFAULT_PREFERENCES.readingSize,
+    theme: ['host', 'light', 'dark', 'green', 'pink', 'blue'].includes(input.theme) ? input.theme : DEFAULT_PREFERENCES.theme,
+  }
+}
+function loadPreferences() {
+  try { return normalizePreferences(JSON.parse(localStorage.getItem(PREFERENCES_KEY))) }
+  catch { return { ...DEFAULT_PREFERENCES } }
+}
+let preferences = loadPreferences()
+let hostTheme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light'
+function applyPreferences() {
+  const root = document.documentElement
+  root.dataset.theme = preferences.theme === 'host' ? hostTheme : preferences.theme
+  if (['green', 'pink', 'blue'].includes(preferences.theme)) root.dataset.skin = preferences.theme
+  else delete root.dataset.skin
+  root.dataset.readingSize = preferences.readingSize
+}
+function persistPreferences() {
+  try { localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences)) } catch { /* Storage can be disabled. */ }
+}
+function setPreference(key, value) {
+  if (!Object.hasOwn(DEFAULT_PREFERENCES, key)) return
+  const next = normalizePreferences({ ...preferences, [key]: value })
+  if (next.zoomSpeed !== preferences.zoomSpeed || next.wheelBehavior !== preferences.wheelBehavior) cancelCanvasZoom()
+  preferences = next
+  persistPreferences()
+  applyPreferences()
+}
+function restoreDefaultPreferences() {
+  cancelCanvasZoom()
+  preferences = { ...DEFAULT_PREFERENCES }
+  state.quickPhrases = [...DEFAULT_QUICK_PHRASES]
+  persistPreferences()
+  persistQuickPhrases()
+  applyPreferences()
+}
+applyPreferences()
+const DEFAULT_QUICK_PHRASES = Object.freeze(['展开说明', '举例', '通俗易懂', '对比解释'])
 const MAX_QUICK_PHRASES = 12
 const MAX_QUICK_PHRASE_LENGTH = 16
 function normalizeQuickPhrases(value) {
@@ -20,8 +66,8 @@ function normalizeQuickPhrases(value) {
 const savedQuickPhrases = (() => {
   try {
     const stored = localStorage.getItem(QUICK_PHRASES_KEY)
-    return stored === null ? DEFAULT_QUICK_PHRASES : normalizeQuickPhrases(JSON.parse(stored))
-  } catch { return DEFAULT_QUICK_PHRASES }
+    return stored === null ? [...DEFAULT_QUICK_PHRASES] : normalizeQuickPhrases(JSON.parse(stored))
+  } catch { return [...DEFAULT_QUICK_PHRASES] }
 })()
 const savedBranchAnchors = (() => {
   try {
@@ -120,6 +166,8 @@ function hydratedCard(card) {
 }
 
 function clearViewCaches() {
+  resetCanvasInteraction()
+  cancelCanvasZoom()
   cancelRegionWork()
   invalidateCanvasGraph()
   bodyLoader.pause({ clearCache: true })
@@ -173,6 +221,8 @@ function pruneWorkspaceCaches() {
 
 function pauseMapBodies() {
   state.mapVisible = false
+  closeSelectMenu({ restoreFocus: false })
+  document.querySelector('.settings-dialog[open]')?.close()
   clearViewCaches()
   state.liveReplies.clear()
   hideSelectionFollowup()
@@ -223,6 +273,7 @@ function resetCardPositions() {
 }
 
 function resetCanvasCamera() {
+  cancelCanvasZoom()
   state.canvasViewInitialized = false
   state.canvasCamera = { x: 0, y: 0 }
 }
@@ -616,7 +667,7 @@ async function sendMessage(thread, text) {
 async function submitDraft() {
   const draft = state.draft
   const text = draft?.text.trim()
-  if (draft === null || !text) return
+  if (draft === null || draft.sending || !text) return
   const branchPosition = draft.kind === 'branch' && state.workspace !== null ? draftPlacement(conversationCards(state.workspace.threads))?.position : undefined
   draft.sending = true
   state.error = ''
@@ -1243,7 +1294,7 @@ function conversationCard(card, graph, overview = false) {
   return `<article class="thread-card ${selected}${overview ? ' card-overview' : ''}" data-card-id="${escapeHtml(card.id)}" data-position-key="${escapeHtml(card.positionKey)}" data-thread="${card.dshThreadId}" style="left:${card.position.x}px;top:${card.position.y}px;--thread-color:#3478f6">
     <button class="node-handle" data-drag-card="${card.id}" aria-label="拖动 ${escapeHtml(question)}" title="拖动卡片"></button>
     ${continueButton}${foldButton}${branchButton}
-    <div class="thread-card-head"><span class="topic-dot"></span><button class="thread-title" data-action="show-thread" data-thread="${card.dshThreadId}" data-card="${escapeHtml(card.id)}" title="查看完整会话：${escapeHtml(question)}">${escapeHtml(question)}</button></div>
+    <div class="thread-card-head" data-card-drag-title><span class="topic-dot"></span><button class="thread-title" data-action="select-card" data-thread="${card.dshThreadId}" data-card="${escapeHtml(card.id)}" title="单击阅读 · 拖动移动 · 双击查看完整会话：${escapeHtml(question)}">${escapeHtml(question)}</button></div>
     <div class="thread-meta"><span>${source}</span><span>第 ${card.turnIndex + 1} 轮</span>${card.error === null ? '' : '<span class="card-error-status">失败</span>'}${card.processCount > 0 ? `<span class="card-process-count">工具 ${card.processCount}</span>` : ''}</div>
     <div class="thread-answer">${faceAnswer}${card.error === null ? '' : `<p class="thread-answer-error">本轮失败：${escapeHtml(String(card.error.text ?? '').slice(0, 300))}</p>`}</div>
     <footer><button data-action="show-thread" data-thread="${card.dshThreadId}" data-card="${escapeHtml(card.id)}" title="查看完整会话" aria-label="查看完整会话"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M2 8.5 8 2.5l6 6V13.5a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5Z"/><path d="M6.2 14v-3.6a1.8 1.8 0 0 1 3.6 0V14" /></svg>详情</button><button data-action="open-dsh" data-thread="${card.dshThreadId}" data-seq="${Number.isInteger(card.sourceSeq) ? card.sourceSeq : ''}" title="在 DSH 中打开" aria-label="在 DSH 中打开"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5H4.5A1.5 1.5 0 0 0 3 5v6.5A1.5 1.5 0 0 0 4.5 13H11a1.5 1.5 0 0 0 1.5-1.5V9"/><path d="M9.5 3.5h3v3M12.4 3.6 7.5 8.5"/></svg>DSH</button><button data-action="archive-thread" data-thread="${card.dshThreadId}" title="归档此会话" aria-label="归档此会话"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5h11M5.5 7v5.5a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1V7"/><path d="M4 5 5 2.8a.7.7 0 0 1 .6-.4h4.8a.7.7 0 0 1 .6.4L12 5M6 9.5h4"/></svg>归档</button></footer>
@@ -1255,10 +1306,10 @@ function draftActions(draft) {
   return `<div class="draft-actions"><button type="button" data-action="cancel-draft" ${disabled} aria-label="取消" title="取消"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 4.5 7 7m0-7-7 7"/></svg></button><button class="primary" type="submit" ${disabled} aria-label="发送" title="发送"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 12.5v-9M4.5 7 8 3.5 11.5 7"/></svg></button></div>`
 }
 
-function quickPhraseEditor(draft) {
+function quickPhraseEditor(draft, { settings = false } = {}) {
   const disabled = draft.sending ? 'disabled' : ''
   const phrases = state.quickPhrases.map((phrase, index) => `<div class="draft-quick-phrase-editor-row"><input data-quick-phrase-index="${index}" maxlength="${MAX_QUICK_PHRASE_LENGTH}" value="${escapeHtml(phrase)}" aria-label="快捷词 ${index + 1}" ${disabled}><button type="button" data-action="remove-quick-phrase" data-quick-phrase-index="${index}" aria-label="删除 ${escapeHtml(phrase)}" title="删除" ${disabled}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 4.5 7 7m0-7-7 7"/></svg></button></div>`).join('')
-  return `<section class="draft-quick-editor" aria-label="编辑快捷词"><div class="draft-quick-editor-list">${phrases}</div><div class="draft-quick-phrase-add"><input maxlength="${MAX_QUICK_PHRASE_LENGTH}" placeholder="添加快捷词" aria-label="添加快捷词" ${disabled}><button class="primary" type="button" data-action="add-quick-phrase" aria-label="添加快捷词" title="添加快捷词" ${disabled}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg></button></div><button class="draft-quick-editor-close" type="button" data-action="close-quick-phrase-editor" ${disabled}>完成</button></section>`
+  return `<section class="draft-quick-editor" aria-label="编辑快捷词"><div class="draft-quick-editor-list">${phrases}</div><div class="draft-quick-phrase-add"><input maxlength="${MAX_QUICK_PHRASE_LENGTH}" placeholder="添加快捷词" aria-label="添加快捷词" ${disabled}><button class="primary" type="button" data-action="add-quick-phrase" aria-label="添加快捷词" title="添加快捷词" ${disabled}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg></button></div>${settings ? '' : `<button class="draft-quick-editor-close" type="button" data-action="close-quick-phrase-editor" ${disabled}>完成</button>`}</section>`
 }
 
 function draftQuickPhrases(draft) {
@@ -1285,28 +1336,519 @@ function insertQuickPhrase(phrase) {
   input.setSelectionRange(caret, caret)
 }
 
-function addQuickPhrase(value) {
+function addQuickPhrase(value, reportError = setError) {
   const phrase = value.trim().slice(0, MAX_QUICK_PHRASE_LENGTH)
   if (phrase === '') return false
-  if (state.quickPhrases.includes(phrase)) return setError('这个快捷词已经存在')
-  if (state.quickPhrases.length >= MAX_QUICK_PHRASES) return setError(`最多保留 ${MAX_QUICK_PHRASES} 个快捷词`)
+  if (state.quickPhrases.includes(phrase)) { reportError('这个快捷词已经存在'); return false }
+  if (state.quickPhrases.length >= MAX_QUICK_PHRASES) { reportError(`最多保留 ${MAX_QUICK_PHRASES} 个快捷词`); return false }
   state.quickPhrases.push(phrase)
   persistQuickPhrases()
   return true
 }
 
-function updateQuickPhrase(index, value) {
-  if (!Number.isInteger(index) || index < 0 || index >= state.quickPhrases.length) return
+function updateQuickPhrase(index, value, reportError = setError) {
+  if (!Number.isInteger(index) || index < 0 || index >= state.quickPhrases.length) return false
   const phrase = value.trim().slice(0, MAX_QUICK_PHRASE_LENGTH)
   if (phrase === '') {
     state.quickPhrases.splice(index, 1)
   } else if (state.quickPhrases.some((item, itemIndex) => itemIndex !== index && item === phrase)) {
-    return setError('这个快捷词已经存在')
+    reportError('这个快捷词已经存在')
+    return false
   } else {
     state.quickPhrases[index] = phrase
   }
   persistQuickPhrases()
   render()
+  return true
+}
+
+function settingsButton(compact = false) {
+  return `<button class="settings-button${compact ? ' settings-button-compact' : ''}" type="button" data-action="open-settings" aria-label="设置" aria-haspopup="dialog" title="设置"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m8 2-.5 2a6 6 0 0 0-1.8 1L3.7 4.5l-2 3.4L3.2 9a7 7 0 0 0 0 2l-1.5 1.1 2 3.4 2-.5a6 6 0 0 0 1.8 1l.5 2h4l.5-2a6 6 0 0 0 1.8-1l2 .5 2-3.4-1.5-1.1a7 7 0 0 0 0-2l1.5-1.1-2-3.4-2 .5a6 6 0 0 0-1.8-1L12 2Z"/><circle cx="10" cy="10" r="2.5"/></svg><span>设置</span></button>`
+}
+
+let activeSelectMenu = null
+
+function styledSelect({ id, label, value, options, disabled = false, attributes = '' }) {
+  const selected = options.find(option => option.value === value) ?? options[0]
+  const current = selected?.value ?? ''
+  const text = selected?.label ?? '暂无可选项'
+  const unavailable = disabled || options.length === 0
+  return `<span class="synapse-select" data-morph-key="select:${id}" data-select-value="${escapeHtml(current)}">
+    <select id="${id}" hidden tabindex="-1" aria-hidden="true" aria-label="${escapeHtml(label)}" ${attributes} ${unavailable ? 'disabled' : ''}>${options.map(option => `<option value="${escapeHtml(option.value)}" title="${escapeHtml(option.title ?? option.label)}" ${option.value === current ? 'selected' : ''}>${escapeHtml(option.label)}</option>`).join('')}</select>
+    <button class="synapse-select-trigger" type="button" data-select-trigger="${id}" aria-haspopup="listbox" aria-controls="${id}-menu" aria-expanded="${activeSelectMenu?.select.id === id}" aria-label="${escapeHtml(`${label}：${text}`)}" title="${escapeHtml(selected?.title ?? text)}" ${unavailable ? 'disabled' : ''}><span class="synapse-select-value">${escapeHtml(text)}</span><svg class="synapse-select-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></button>
+  </span>`
+}
+
+function selectOptions(select) {
+  return [...select.options].filter(option => !option.disabled).map(option => ({
+    value: option.value, label: option.textContent, title: option.title,
+  }))
+}
+
+function selectSignature(select) {
+  return JSON.stringify([select.value, select.disabled, selectOptions(select)])
+}
+
+function closeSelectMenu({ restoreFocus = true } = {}) {
+  const active = activeSelectMenu
+  if (active === null) return
+  activeSelectMenu = null
+  active.controller.abort()
+  active.menu.remove()
+  active.trigger.setAttribute('aria-expanded', 'false')
+  if (restoreFocus && active.trigger.isConnected && active.trigger.getClientRects().length > 0) {
+    active.trigger.focus({ preventScroll: true })
+  }
+}
+
+function selectMenuPlacement(bounds, viewportWidth, viewportHeight, contentHeight) {
+  const margin = 8
+  const gap = 5
+  const below = Math.max(0, viewportHeight - margin - bounds.bottom - gap)
+  const above = Math.max(0, bounds.top - margin - gap)
+  const upward = below < Math.min(contentHeight, 180) && above > below
+  const height = Math.min(contentHeight, 280, upward ? above : below)
+  const width = Math.min(Math.max(108, bounds.width), Math.max(0, viewportWidth - margin * 2))
+  return {
+    left: Math.max(margin, Math.min(bounds.left, viewportWidth - margin - width)),
+    top: upward ? bounds.top - gap - height : bounds.bottom + gap,
+    width, height,
+  }
+}
+
+function positionSelectMenu() {
+  const active = activeSelectMenu
+  if (active === null) return
+  if (!active.trigger.isConnected || active.select.disabled || active.trigger.getClientRects().length === 0) {
+    closeSelectMenu({ restoreFocus: false })
+    return
+  }
+  const bounds = active.trigger.getBoundingClientRect()
+  const viewportWidth = document.documentElement.clientWidth
+  if (bounds.bottom <= 0 || bounds.top >= window.innerHeight || bounds.right <= 0 || bounds.left >= viewportWidth) {
+    closeSelectMenu({ restoreFocus: false })
+    return
+  }
+  const placement = selectMenuPlacement(bounds, viewportWidth, window.innerHeight, active.menu.scrollHeight + 2)
+  Object.assign(active.menu.style, {
+    left: `${placement.left}px`, top: `${placement.top}px`,
+    width: `${placement.width}px`, maxHeight: `${placement.height}px`,
+  })
+}
+
+function syncSelectControls(scope) {
+  for (const wrapper of scope.querySelectorAll('.synapse-select')) {
+    // Native selectedness becomes dirty after a value change. Reconcile the
+    // backing value explicitly when the host supplies a newer workspace.
+    wrapper.querySelector('select').value = wrapper.dataset.selectValue
+  }
+  const active = activeSelectMenu
+  if (active !== null && (!active.trigger.isConnected || selectSignature(active.select) !== active.signature)) {
+    closeSelectMenu({ restoreFocus: false })
+  }
+}
+
+function openSelectMenu(trigger, { last = false } = {}) {
+  if (activeSelectMenu?.trigger === trigger) { closeSelectMenu(); return }
+  closeCanvasMenu({ restoreFocus: false })
+  closeSelectMenu({ restoreFocus: false })
+  const select = trigger.closest('.synapse-select')?.querySelector('select')
+  if (!(select instanceof HTMLSelectElement) || select.disabled) return
+  const options = selectOptions(select)
+  if (options.length === 0) return
+  const menu = document.createElement('div')
+  menu.className = 'synapse-select-menu'
+  menu.id = `${select.id}-menu`
+  menu.tabIndex = -1
+  menu.setAttribute('role', 'listbox')
+  menu.setAttribute('aria-label', select.getAttribute('aria-label'))
+  menu.innerHTML = options.map((option, index) => `<div class="synapse-select-option" id="${menu.id}-${index}" role="option" aria-selected="${option.value === select.value}" data-select-option="${index}" title="${escapeHtml(option.title || option.label)}"><span>${escapeHtml(option.label)}</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 8 3 3 6-6"/></svg></div>`).join('')
+  const controller = new AbortController()
+  const { signal } = controller
+  const owner = trigger.closest('dialog') ?? document.body
+  // Popovers live above the modal and its scrolling/overflow boundaries. Keep
+  // the menu inside the dialog's DOM so modal inertness does not block input.
+  if (typeof menu.showPopover === 'function') menu.setAttribute('popover', 'manual')
+  menu.style.visibility = 'hidden'
+  owner.append(menu)
+  if (typeof menu.showPopover === 'function') menu.showPopover()
+  const selectedIndex = Math.max(0, options.findIndex(option => option.value === select.value))
+  const active = { menu, trigger, select, options, controller, signature: selectSignature(select),
+    index: last ? options.length - 1 : selectedIndex }
+  activeSelectMenu = active
+  trigger.setAttribute('aria-expanded', 'true')
+  positionSelectMenu()
+  if (activeSelectMenu !== active) return
+  menu.style.visibility = ''
+  const highlight = index => {
+    active.index = Math.max(0, Math.min(options.length - 1, index))
+    for (const item of menu.querySelectorAll('[data-select-option]')) {
+      item.classList.toggle('is-active', Number(item.dataset.selectOption) === active.index)
+    }
+    const item = menu.querySelector(`[data-select-option="${active.index}"]`)
+    menu.setAttribute('aria-activedescendant', item.id)
+    item.scrollIntoView({ block: 'nearest' })
+  }
+  const choose = index => {
+    const option = options[index]
+    if (!option || !select.isConnected || select.disabled || !selectOptions(select).some(item => item.value === option.value)) {
+      closeSelectMenu({ restoreFocus: false })
+      return
+    }
+    const changed = select.value !== option.value
+    select.value = option.value
+    select.closest('.synapse-select').dataset.selectValue = option.value
+    trigger.querySelector('.synapse-select-value').textContent = option.label
+    trigger.setAttribute('aria-label', `${select.getAttribute('aria-label')}：${option.label}`)
+    trigger.title = option.title || option.label
+    closeSelectMenu()
+    // Reuse the original workspace/preferences change paths, including the
+    // user-owned load ticket and DSH current-session synchronization.
+    if (changed) select.dispatchEvent(new Event('change', { bubbles: true }))
+  }
+  menu.addEventListener('click', event => {
+    const option = event.target instanceof Element ? event.target.closest('[data-select-option]') : null
+    if (option) choose(Number(option.dataset.selectOption))
+  }, { signal })
+  menu.addEventListener('pointermove', event => {
+    const option = event.target instanceof Element ? event.target.closest('[data-select-option]') : null
+    if (option && Number(option.dataset.selectOption) !== active.index) highlight(Number(option.dataset.selectOption))
+  }, { signal })
+  let search = ''
+  let searchAt = 0
+  menu.addEventListener('keydown', event => {
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End', 'Enter', ' ', 'Escape'].includes(event.key)) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (event.key === 'ArrowDown') highlight((active.index + 1) % options.length)
+      if (event.key === 'ArrowUp') highlight((active.index + options.length - 1) % options.length)
+      if (event.key === 'Home') highlight(0)
+      if (event.key === 'End') highlight(options.length - 1)
+      if (event.key === 'Enter' || event.key === ' ') choose(active.index)
+      if (event.key === 'Escape') closeSelectMenu()
+    } else if (event.key === 'Tab') {
+      closeSelectMenu()
+    } else if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const now = Date.now()
+      search = now - searchAt > 600 ? event.key : search + event.key
+      searchAt = now
+      const found = options.findIndex(option => option.label.toLocaleLowerCase().startsWith(search.toLocaleLowerCase()))
+      if (found >= 0) highlight(found)
+    }
+  }, { signal })
+  document.addEventListener('pointerdown', event => {
+    if (!menu.contains(event.target) && !trigger.contains(event.target)) closeSelectMenu({ restoreFocus: false })
+    else if (menu.contains(event.target) && event.pointerType !== 'touch' && event.button === 0) event.preventDefault()
+  }, { capture: true, signal })
+  document.addEventListener('focusin', event => {
+    if (!menu.contains(event.target) && !trigger.contains(event.target)) closeSelectMenu({ restoreFocus: false })
+  }, { signal })
+  document.addEventListener('scroll', event => {
+    if (!menu.contains(event.target)) positionSelectMenu()
+  }, { capture: true, signal })
+  window.addEventListener('resize', positionSelectMenu, { signal })
+  menu.focus({ preventScroll: true })
+  highlight(active.index)
+}
+
+document.addEventListener('click', event => {
+  const trigger = event.target instanceof Element ? event.target.closest('[data-select-trigger]') : null
+  if (trigger instanceof HTMLButtonElement && !trigger.disabled) openSelectMenu(trigger)
+})
+document.addEventListener('keydown', event => {
+  const trigger = event.target instanceof Element ? event.target.closest('[data-select-trigger]') : null
+  if (!(trigger instanceof HTMLButtonElement) || trigger.disabled) return
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault()
+    openSelectMenu(trigger, { last: event.key === 'ArrowUp' })
+  }
+})
+document.addEventListener('visibilitychange', () => { if (document.hidden) closeSelectMenu({ restoreFocus: false }) })
+
+let activeCanvasMenu = null
+
+function canvasMenuOptions(kind) {
+  if (kind === 'more') return [
+    { action: 'layout', label: '自动整理卡片', disabled: state.workspace === null || (state.canvasCards?.length ?? 0) === 0 },
+    { action: 'shortcut-help', label: '快捷键帮助', shortcut: '?' },
+  ]
+  if (kind === 'zoom') return [
+    { action: 'zoom-reset', label: '恢复 100%', shortcut: '0' },
+    { action: 'fit-canvas', label: '适配当前范围', shortcut: 'Shift + 1', disabled: (state.canvasCards?.length ?? 0) === 0 },
+    { action: 'fit-selected', label: '适配选中卡片', shortcut: 'Shift + 2', disabled: !state.canvasCardsById?.has(state.selectedCardId) },
+  ]
+  return []
+}
+
+function canvasMenuScope() {
+  return JSON.stringify([state.mode, state.workspace?.id, state.focusedThreadId])
+}
+
+function closeCanvasMenu({ restoreFocus = true } = {}) {
+  const active = activeCanvasMenu
+  if (active === null) return
+  activeCanvasMenu = null
+  active.controller.abort()
+  active.menu.remove()
+  active.trigger.setAttribute('aria-expanded', 'false')
+  if (restoreFocus && active.trigger.isConnected && active.trigger.getClientRects().length > 0) {
+    active.trigger.focus({ preventScroll: true })
+  }
+}
+
+function positionCanvasMenu() {
+  const active = activeCanvasMenu
+  if (active === null) return
+  if (!active.trigger.isConnected || active.trigger.disabled || active.trigger.getClientRects().length === 0) {
+    closeCanvasMenu({ restoreFocus: false }); return
+  }
+  const bounds = active.trigger.getBoundingClientRect()
+  const viewportWidth = document.documentElement.clientWidth
+  if (bounds.bottom <= 0 || bounds.top >= window.innerHeight || bounds.right <= 0 || bounds.left >= viewportWidth) {
+    closeCanvasMenu({ restoreFocus: false }); return
+  }
+  // Reuse the select menu's viewport bounds and upward-opening calculation.
+  const width = Math.min(228, Math.max(0, viewportWidth - 16))
+  const placement = selectMenuPlacement({ left: bounds.right - width, width, top: bounds.top, bottom: bounds.bottom },
+    viewportWidth, window.innerHeight, active.menu.scrollHeight + 2)
+  Object.assign(active.menu.style, {
+    left: `${placement.left}px`, top: `${placement.top}px`,
+    width: `${placement.width}px`, maxHeight: `${placement.height}px`,
+  })
+}
+
+function syncCanvasMenus() {
+  const active = activeCanvasMenu
+  if (active === null) return
+  if (!active.trigger.isConnected || active.scope !== canvasMenuScope()
+    || active.signature !== JSON.stringify(canvasMenuOptions(active.kind))) {
+    closeCanvasMenu({ restoreFocus: active.trigger.isConnected }); return
+  }
+  active.trigger.setAttribute('aria-expanded', 'true')
+  positionCanvasMenu()
+}
+
+// Both menu items and toolbar buttons use the same camera/layout operations.
+function performCanvasAction(action) {
+  switch (action) {
+    case 'zoom-in': zoomCanvasAtCenter(.1); break
+    case 'zoom-out': zoomCanvasAtCenter(-.1); break
+    case 'zoom-reset': zoomCanvasAtCenter(1 - state.zoom); break
+    case 'fit-canvas': fitCanvasCards(); break
+    case 'fit-selected': fitCanvasCards(true); break
+    case 'focus-active': focusActiveCard({ preferSelection: true }); break
+    case 'shortcut-help': openShortcutHelp(); break
+    case 'layout':
+      if (state.workspace !== null) {
+        resetCardPositions()
+        resetCanvasCamera()
+        render()
+      }
+      break
+    default: return false
+  }
+  return true
+}
+
+function openCanvasMenu(trigger, { last = false } = {}) {
+  if (activeCanvasMenu?.trigger === trigger) { closeCanvasMenu(); return }
+  closeCanvasMenu({ restoreFocus: false })
+  closeSelectMenu({ restoreFocus: false })
+  if (state.mode !== 'canvas' || !trigger.isConnected || trigger.disabled) return
+  const kind = trigger.dataset.canvasMenu
+  const options = canvasMenuOptions(kind)
+  if (options.length === 0) return
+  const menu = document.createElement('div')
+  menu.className = 'synapse-select-menu canvas-action-menu'
+  menu.id = `synapse-canvas-${kind}-menu`
+  menu.setAttribute('role', 'menu')
+  menu.setAttribute('aria-label', kind === 'zoom' ? '缩放与适配' : '更多画布操作')
+  menu.innerHTML = options.map((option, index) => `<button type="button" role="menuitem" tabindex="-1" data-canvas-menu-item="${index}" ${option.disabled ? 'disabled' : ''}><span>${escapeHtml(option.label)}</span>${option.shortcut ? `<kbd>${escapeHtml(option.shortcut)}</kbd>` : ''}</button>`).join('')
+  const controller = new AbortController()
+  const { signal } = controller
+  if (typeof menu.showPopover === 'function') menu.setAttribute('popover', 'manual')
+  menu.style.visibility = 'hidden'
+  document.body.append(menu)
+  if (typeof menu.showPopover === 'function') menu.showPopover()
+  const items = [...menu.querySelectorAll('[data-canvas-menu-item]')]
+  const enabled = items.filter(item => !item.disabled)
+  const active = { menu, trigger, kind, controller, scope: canvasMenuScope(), signature: JSON.stringify(options) }
+  activeCanvasMenu = active
+  trigger.setAttribute('aria-expanded', 'true')
+  positionCanvasMenu()
+  if (activeCanvasMenu !== active) return
+  menu.style.visibility = ''
+  const focusItem = index => {
+    const item = enabled[(index + enabled.length) % enabled.length]
+    for (const entry of items) entry.tabIndex = entry === item ? 0 : -1
+    item?.focus({ preventScroll: true })
+    item?.scrollIntoView({ block: 'nearest' })
+  }
+  menu.addEventListener('click', event => {
+    const item = event.target instanceof Element ? event.target.closest('[data-canvas-menu-item]') : null
+    if (!(item instanceof HTMLButtonElement) || item.disabled) return
+    const option = canvasMenuOptions(kind)[Number(item.dataset.canvasMenuItem)]
+    const valid = trigger.isConnected && active.scope === canvasMenuScope() && option && !option.disabled
+    closeCanvasMenu({ restoreFocus: Boolean(valid) })
+    if (valid) {
+      try { performCanvasAction(option.action) } catch (error) { setError(error) }
+    }
+  }, { signal })
+  menu.addEventListener('keydown', event => {
+    if (event.isComposing || event.keyCode === 229) return
+    const index = enabled.indexOf(document.activeElement)
+    if (['ArrowDown', 'ArrowUp', 'Home', 'End', 'Escape'].includes(event.key)) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (event.key === 'ArrowDown') focusItem(index + 1)
+      if (event.key === 'ArrowUp') focusItem(index - 1)
+      if (event.key === 'Home') focusItem(0)
+      if (event.key === 'End') focusItem(enabled.length - 1)
+      if (event.key === 'Escape') closeCanvasMenu()
+    } else if (event.key === 'Tab') closeCanvasMenu()
+  }, { signal })
+  document.addEventListener('pointerdown', event => {
+    if (!menu.contains(event.target) && !trigger.contains(event.target)) closeCanvasMenu({ restoreFocus: false })
+  }, { capture: true, signal })
+  document.addEventListener('focusin', event => {
+    if (!menu.contains(event.target) && !trigger.contains(event.target)) closeCanvasMenu({ restoreFocus: false })
+  }, { signal })
+  document.addEventListener('scroll', event => {
+    if (!menu.contains(event.target)) positionCanvasMenu()
+  }, { capture: true, signal })
+  window.addEventListener('resize', positionCanvasMenu, { signal })
+  focusItem(last ? enabled.length - 1 : 0)
+}
+
+document.addEventListener('click', event => {
+  const trigger = event.target instanceof Element ? event.target.closest('[data-canvas-menu]') : null
+  if (trigger instanceof HTMLButtonElement && !trigger.disabled) openCanvasMenu(trigger)
+})
+document.addEventListener('keydown', event => {
+  const trigger = event.target instanceof Element ? event.target.closest('[data-canvas-menu]') : null
+  if (!(trigger instanceof HTMLButtonElement) || trigger.disabled || event.isComposing || event.keyCode === 229) return
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault()
+    openCanvasMenu(trigger, { last: event.key === 'ArrowUp' })
+  }
+})
+
+function settingsControls() {
+  const select = (key, label, options) => styledSelect({
+    id: `synapse-pref-${key}`, label, value: preferences[key], attributes: `data-preference="${key}"`,
+    options: options.map(([value, label]) => ({ value, label })),
+  })
+  return `<div class="settings-row"><span><strong>滚轮操作</strong><small>卡片正文保持原生滚动；Ctrl / ⌘ + 滚轮缩放</small></span>${select('wheelBehavior', '滚轮操作', [['pan', '平移画布'], ['zoom', '直接缩放']])}</div>
+    <div class="settings-row"><span><strong>画布缩放速度</strong><small>调整滚轮放大、缩小的幅度</small></span>${select('zoomSpeed', '画布缩放速度', [['slow', '慢'], ['standard', '标准'], ['fast', '快']])}</div>
+    <div class="settings-row"><span><strong>发送快捷键</strong><small>Enter 换行，或 Shift + Enter 换行</small></span>${select('sendShortcut', '发送快捷键', [['modifier-enter', 'Ctrl / ⌘ + Enter'], ['enter', 'Enter']])}</div>
+    <div class="settings-row"><span><strong>阅读字号</strong><small>用于详情和右侧阅读面板</small></span>${select('readingSize', '阅读字号', [['standard', '标准'], ['large', '大']])}</div>
+    <div class="settings-row"><span><strong>主题</strong><small>选择地图的显示外观</small></span>${select('theme', '主题', [['host', '跟随 DSH'], ['light', '浅色'], ['dark', '深色'], ['green', '浅绿'], ['pink', '浅粉'], ['blue', '浅蓝']])}</div>`
+}
+
+function openSettings() {
+  if (document.querySelector('.settings-dialog[open]')) return
+  closeSelectMenu({ restoreFocus: false })
+  cancelCanvasZoom()
+  resetCanvasInteraction()
+  hideSelectionFollowup()
+  // Mount outside #app: host polling can morph the map without replacing
+  // focused settings inputs or the dialog's native open state.
+  const dialog = document.createElement('dialog')
+  dialog.className = 'settings-dialog'
+  dialog.setAttribute('aria-labelledby', 'synapse-settings-title')
+  dialog.innerHTML = `<header class="settings-head"><h2 id="synapse-settings-title">设置</h2><button type="button" data-settings-action="close" aria-label="关闭设置" title="关闭设置" autofocus>×</button></header>
+    <div class="settings-body"><div data-settings-controls>${settingsControls()}</div>
+    <section class="settings-phrases"><h3>快捷追问词</h3><p>最多 ${MAX_QUICK_PHRASES} 个，每个 ${MAX_QUICK_PHRASE_LENGTH} 字。编辑后即时保存。</p><div data-settings-phrases>${quickPhraseEditor({ sending: false }, { settings: true })}</div><p class="settings-error" role="status" aria-live="polite" hidden></p></section>
+    <section class="settings-about"><h3>关于 Synapse</h3><p data-plugin-info aria-live="polite">正在读取已加载版本…</p></section></div>
+    <footer class="settings-foot"><span>仅保存在本机</span><button type="button" data-settings-action="reset" title="恢复操作偏好、外观和快捷词">恢复默认设置</button></footer>`
+  const controller = new AbortController()
+  const reportError = message => {
+    const status = dialog.querySelector('.settings-error')
+    status.textContent = message
+    status.hidden = !message
+  }
+  const refreshPhrases = () => {
+    dialog.querySelector('[data-settings-phrases]').innerHTML = quickPhraseEditor({ sending: false }, { settings: true })
+    reportError('')
+  }
+  dialog.addEventListener('close', () => {
+    closeSelectMenu({ restoreFocus: false })
+    controller.abort()
+    dialog.remove()
+    if (state.mapVisible) {
+      const trigger = [...document.querySelectorAll('[data-action="open-settings"]')].find(button => button.getClientRects().length > 0)
+      trigger?.focus({ preventScroll: true })
+    }
+  }, { once: true })
+  dialog.addEventListener('change', event => {
+    const input = event.target
+    if (input instanceof HTMLSelectElement && input.dataset.preference) {
+      setPreference(input.dataset.preference, input.value)
+    } else if (input instanceof HTMLInputElement && input.dataset.quickPhraseIndex !== undefined) {
+      const index = Number(input.dataset.quickPhraseIndex)
+      if (input.value.trim() === '') {
+        input.value = state.quickPhrases[index] ?? ''
+        reportError('快捷词不能为空，请使用删除按钮移除')
+        return
+      }
+      const updated = updateQuickPhrase(index, input.value, reportError)
+      // Keep surviving controls mounted: a blur caused by clicking Add/Delete
+      // must not replace the pending click target before its click arrives.
+      input.value = state.quickPhrases[index] ?? ''
+      input.closest('.draft-quick-phrase-editor-row').querySelector('button').setAttribute('aria-label', `删除 ${input.value}`)
+      if (updated) reportError('')
+    }
+  })
+  const addPhrase = () => {
+    const input = dialog.querySelector('.draft-quick-phrase-add input')
+    if (addQuickPhrase(input.value, reportError)) {
+      refreshPhrases()
+      render()
+      dialog.querySelector('.draft-quick-phrase-add input').focus()
+    }
+  }
+  dialog.addEventListener('keydown', event => {
+    // Do not let Escape also close the inspector underneath the native modal.
+    if (event.key === 'Escape') event.stopPropagation()
+    if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229 && event.target instanceof HTMLInputElement) {
+      event.preventDefault()
+      if (event.target.closest('.draft-quick-phrase-add')) addPhrase()
+      else event.target.blur()
+    }
+  })
+  dialog.addEventListener('click', event => {
+    const button = event.target instanceof Element ? event.target.closest('button') : null
+    if (!button) return
+    if (button.dataset.settingsAction === 'close') dialog.close()
+    if (button.dataset.settingsAction === 'reset') {
+      closeSelectMenu({ restoreFocus: false })
+      restoreDefaultPreferences()
+      dialog.querySelector('[data-settings-controls]').innerHTML = settingsControls()
+      refreshPhrases()
+      render()
+    }
+    if (button.dataset.action === 'add-quick-phrase') addPhrase()
+    if (button.dataset.action === 'remove-quick-phrase') {
+      const index = Number(button.dataset.quickPhraseIndex)
+      if (!Number.isInteger(index) || index < 0 || index >= state.quickPhrases.length) return
+      state.quickPhrases.splice(index, 1)
+      persistQuickPhrases()
+      refreshPhrases()
+      render()
+      dialog.querySelector('.draft-quick-phrase-add input').focus()
+    }
+  })
+  document.body.append(dialog)
+  dialog.showModal()
+  const info = dialog.querySelector('[data-plugin-info]')
+  void api('/synapse/api/info', { signal: controller.signal }).then(data => {
+    if (!info.isConnected) return
+    info.textContent = typeof data.version === 'string'
+      ? `已加载版本 ${data.version} · 构建 ${typeof data.build === 'string' ? data.build : '未标记'}`
+      : '已加载版本暂不可用'
+  }).catch(error => {
+    if (error.name !== 'AbortError' && info.isConnected) info.textContent = '已加载版本暂不可用，请重启 DSH 后重试'
+  })
 }
 
 function draftPlacement(cards) {
@@ -1516,8 +2058,6 @@ function mountRegionBatch(generation) {
     regionElements.set(id, element)
     state.mountedCardIds.add(id)
     regionDirtyCards.delete(id)
-    const handle = element.querySelector('[data-drag-card]')
-    if (handle instanceof HTMLElement) bindDragHandle(handle)
     count++
   }
   updateRegionStatus()
@@ -1597,7 +2137,23 @@ function syncCanvasDraft() {
 function canvasScopeControls(threads) {
   const focused = state.focusedThreadId !== null
   const canFocus = threads.some(thread => thread.id === state.activeId)
-  return `<div class="canvas-scope-controls" role="group" aria-label="地图显示范围"><button type="button" data-action="show-workspace" aria-pressed="${!focused}" ${state.draft !== null ? 'disabled' : ''}>全工作区</button><button type="button" data-action="focus-thread" aria-pressed="${focused}" title="只显示选中会话及其派生分支" ${!canFocus || state.draft !== null ? 'disabled' : ''}>聚焦会话</button></div>`
+  return `<div class="canvas-control-group canvas-scope-controls" role="group" aria-label="地图显示范围"><button type="button" data-action="show-workspace" aria-pressed="${!focused}" ${state.draft !== null ? 'disabled' : ''}>全工作区</button><button type="button" data-action="focus-thread" aria-pressed="${focused}" title="只显示选中会话及其派生分支" ${!canFocus || state.draft !== null ? 'disabled' : ''}>聚焦会话</button></div>`
+}
+
+function canvasBottomControls() {
+  return `<div class="canvas-bottom-controls" data-morph-key="canvas-bottom-controls">
+    <div class="canvas-controls canvas-control-group canvas-tool-controls" role="group" aria-label="画布工具">
+      <button type="button" data-action="canvas-tool" data-canvas-tool="select" aria-pressed="${canvasTool === 'select'}" aria-label="选择与阅读" title="选择与阅读（V）"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m3 2 10 6-4.5 1L7 13Z"/></svg></button>
+      <button type="button" data-action="canvas-tool" data-canvas-tool="pan" aria-pressed="${canvasTool === 'pan'}" aria-label="平移画布" title="平移画布（H）"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M5.5 8V4a1 1 0 0 1 2 0v3M7.5 7V2.5a1 1 0 0 1 2 0V7M9.5 7V3.5a1 1 0 0 1 2 0V8M11.5 7a1 1 0 0 1 2 0v3c0 2.5-1.5 4-4 4h-1c-1.3 0-2.3-.7-3-1.7L2.7 9a1 1 0 0 1 1.5-1.3L5.5 9"/></svg></button>
+    </div>
+    <div class="canvas-controls canvas-control-group canvas-view-controls" role="group" aria-label="定位与缩放">
+      <button type="button" data-action="focus-active" title="居中选中卡片或当前会话（F）" aria-label="定位选中卡片或当前会话"><svg aria-hidden="true" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.5v2.6M8 11.9v2.6M1.5 8h2.6M11.9 8h2.6"/></svg></button>
+      <span class="canvas-control-divider" aria-hidden="true"></span>
+      <button type="button" data-action="zoom-out" aria-label="缩小" title="缩小（−）"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3.5 8h9"/></svg></button>
+      <button type="button" data-morph-key="canvas-zoom-menu" data-canvas-menu="zoom" class="canvas-zoom-label" title="缩放与适配" aria-label="缩放 ${Math.round(state.zoom * 100)}%，打开缩放与适配菜单" aria-haspopup="menu" aria-controls="synapse-canvas-zoom-menu" aria-expanded="${activeCanvasMenu?.kind === 'zoom'}"><span data-canvas-zoom-value>${Math.round(state.zoom * 100)}%</span><svg class="canvas-menu-chevron" aria-hidden="true" viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></svg></button>
+      <button type="button" data-action="zoom-in" aria-label="放大" title="放大（+）"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9"/></svg></button>
+    </div>
+  </div>`
 }
 
 function renderCanvas() {
@@ -1625,7 +2181,7 @@ function renderCanvas() {
   const focusedThread = threads.find(thread => thread.id === state.focusedThreadId)
   const focusLabel = focusedThread === undefined ? '' : `<div class="canvas-focus-label" title="${escapeHtml(threadListTitle(focusedThread))}"><strong>聚焦：${escapeHtml(threadListTitle(focusedThread))}</strong><span>含派生分支</span></div>`
   const focusEmpty = focusedThread !== undefined && cards.length === 0 ? '<div class="canvas-focus-empty">该会话及其分支还没有可显示的对话。</div>' : ''
-  return `<section class="canvas-view" data-morph-key="canvas"><div class="canvas-viewport"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors" data-morph-key="links:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></svg><div class="cards-layer" data-morph-key="cards:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></div></div></div>${focusLabel}${focusEmpty}<div class="region-status" role="status" hidden><i aria-hidden="true"></i><span></span><button type="button" data-action="retry-bodies" hidden>重试</button></div>${inspector}</section>`
+  return `<section class="canvas-view" data-morph-key="canvas"><div class="canvas-viewport" tabindex="0" role="region" aria-label="会话地图，按问号查看快捷键"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors" data-morph-key="links:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></svg><div class="cards-layer" data-morph-key="cards:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></div></div></div>${focusLabel}${focusEmpty}<div class="region-status" role="status" hidden><i aria-hidden="true"></i><span></span><button type="button" data-action="retry-bodies" hidden>重试</button></div>${canvasBottomControls()}${inspector}</section>`
 }
 
 function isProcessMessage(message) {
@@ -1841,10 +2397,23 @@ function render() {
   const view = state.mode === 'thread' ? renderThread() : renderCanvas()
   const choices = workspaceChoices()
   const selectedWorkspaceId = state.selectedDshWorkspaceId ?? workspace?.id
-  const canvasControls = state.mode === 'canvas' && (threads.length > 0 || state.draft?.kind === 'new') ? `<div class="canvas-controls">${canvasScopeControls(threads)}<button data-action="layout" title="整理节点" aria-label="整理节点"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/></svg>整理</button><button data-action="focus-active" title="定位到当前会话" aria-label="定位到当前会话"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.5v2.6M8 11.9v2.6M1.5 8h2.6M11.9 8h2.6"/></svg>定位</button><button data-action="zoom-out" aria-label="缩小" title="缩小"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3.5 8h9"/></svg></button><span class="canvas-zoom-label">${Math.round(state.zoom * 100)}%</span><button data-action="zoom-in" aria-label="放大" title="放大"><svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M8 3.5v9M3.5 8h9"/></svg></button></div>` : ''
+  const canvasControls = state.mode === 'canvas' ? `<div class="canvas-controls canvas-top-controls" data-morph-key="canvas-top-controls">${canvasScopeControls(threads)}
+    <button type="button" class="canvas-more-button" data-morph-key="canvas-more-menu" data-canvas-menu="more" title="更多画布操作" aria-label="更多画布操作" aria-haspopup="menu" aria-controls="synapse-canvas-more-menu" aria-expanded="${activeCanvasMenu?.kind === 'more'}"><svg aria-hidden="true" viewBox="0 0 16 16"><circle cx="3" cy="8" r=".8"/><circle cx="8" cy="8" r=".8"/><circle cx="13" cy="8" r=".8"/></svg></button></div>` : ''
   const detailAvailable = currentThread() !== null
   const canvasTabs = `<nav class="canvas-tabs" aria-label="会话地图视图"><button class="${state.mode === 'canvas' ? 'active' : ''}" data-action="show-canvas">地图</button><button class="${state.mode === 'thread' ? 'active' : ''}" data-action="show-thread" data-thread="${state.activeId ?? ''}" ${detailAvailable ? '' : 'disabled'}>详情</button></nav>`
-  morphInto(app, `<main class="synapse-shell ${state.sidebarCollapsed ? 'sidebar-collapsed' : ''}"><aside class="sidebar"><div class="sidebar-brand-row"><div class="brand" aria-label="Synapse"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 32 32" fill="none"><path d="M9 10.5 16 7l7 3.5M9 10.5v8L16 22m0-15v15m7-11.5v8L16 22"/><circle cx="9" cy="10" r="2.5"/><circle cx="23" cy="10" r="2.5"/><circle cx="16" cy="23" r="2.5"/></svg><strong>Synapse</strong></div><button class="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-label="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}" title="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.25"/><path d="M6 2v12"/></svg></button></div><button class="new-workspace" type="button" data-action="create-session" ${state.draft !== null ? 'disabled' : ''}><svg class="new-session-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v6.5M4.75 8h6.5"/></svg><span>新会话</span></button><label class="workspace-label"><span>工作区</span><span class="workspace-select"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 4.75h3l1.2 1.5h6.8v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"/></svg><select data-action="select-workspace" aria-label="选择工作区" ${state.draft !== null ? 'disabled' : ''}>${choices.map(item => `<option value="${item.id}" title="${escapeHtml(item.path ?? item.title)}" ${item.id === selectedWorkspaceId ? 'selected' : ''}>${escapeHtml(item.title)}</option>`).join('')}</select></span></label><div class="sidebar-heading"><span>会话</span></div><nav class="thread-tree">${threads.map(thread => `<button class="tree-row ${thread.id === state.activeId ? 'active' : ''}" data-action="select-thread" data-thread="${thread.id}" style="--thread-color:#374151"><span class="tree-dot"></span><span>${escapeHtml(threadListTitle(thread))}</span>${thread.parentId === null ? '' : '<i>分支</i>'}</button>`).join('') || '<p class="tree-empty">暂未同步会话</p>'}</nav></aside><header class="topbar">${canvasControls}</header><section class="main-stage">${state.error ? `<div class="status-message" role="alert"><span>${escapeHtml(state.error)}</span><button data-action="dismiss-error" aria-label="关闭" title="关闭">×</button></div>` : ''}${canvasTabs}${view}${selectionFollowupButton()}</section></main>`)
+  morphInto(app, `<main class="synapse-shell ${state.sidebarCollapsed ? 'sidebar-collapsed' : ''}">
+    <aside class="sidebar">
+      <div class="sidebar-brand-row"><div class="brand" aria-label="Synapse"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 32 32" fill="none"><path d="M9 10.5 16 7l7 3.5M9 10.5v8L16 22m0-15v15m7-11.5v8L16 22"/><circle cx="9" cy="10" r="2.5"/><circle cx="23" cy="10" r="2.5"/><circle cx="16" cy="23" r="2.5"/></svg><strong>Synapse</strong></div><button class="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-label="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}" title="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.25"/><path d="M6 2v12"/></svg></button></div>
+      <button class="new-workspace" type="button" data-action="create-session" ${state.draft !== null ? 'disabled' : ''}><svg class="new-session-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v6.5M4.75 8h6.5"/></svg><span>新会话</span></button>
+      <div class="workspace-label"><span>工作区</span><span class="workspace-select"><svg class="workspace-folder-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 4.75h3l1.2 1.5h6.8v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"/></svg>${styledSelect({ id: 'synapse-workspace-select', label: '选择工作区', value: selectedWorkspaceId, disabled: state.draft !== null, attributes: 'data-action="select-workspace"', options: choices.map(item => ({ value: item.id, label: item.title, title: item.path ?? item.title })) })}</span></div>
+      <div class="sidebar-heading"><span>会话</span></div>
+      <nav class="thread-tree">${threads.map(thread => `<button class="tree-row ${thread.id === state.activeId ? 'active' : ''}" data-action="select-thread" data-thread="${thread.id}" style="--thread-color:#374151"><span class="tree-dot"></span><span>${escapeHtml(threadListTitle(thread))}</span>${thread.parentId === null ? '' : '<i>分支</i>'}</button>`).join('') || '<p class="tree-empty">暂未同步会话</p>'}</nav>
+      <footer class="sidebar-footer">${settingsButton()}</footer>
+    </aside>
+    <header class="topbar">${canvasControls}${settingsButton(true)}</header><section class="main-stage">${state.error ? `<div class="status-message" role="alert"><span>${escapeHtml(state.error)}</span><button data-action="dismiss-error" aria-label="关闭" title="关闭">×</button></div>` : ''}${canvasTabs}${view}${selectionFollowupButton()}</section>
+  </main>`)
+  syncSelectControls(app)
+  syncCanvasMenus()
   if (state.mode === 'canvas' && document.querySelector('.cards-layer')) {
     syncCanvasDraft()
     syncCanvasViewport({ immediate: true })
@@ -1854,7 +2423,7 @@ function render() {
     regionElements.clear()
     state.mountedCardIds.clear()
   }
-  installDragging()
+  syncCanvasInteraction()
   // The initial camera from renderCanvas is inset (viewport not laid out yet);
   // center it on the focused card once the canvas DOM is mounted.
   if (state.canvasNeedsCenter) {
@@ -2129,113 +2698,279 @@ function morphInto(container, html) {
   }
 }
 
-const boundDragHandles = new WeakSet()
-function bindDragHandle(handle) {
-  // Cards now survive a render, so bind each drag handle once.
-  if (boundDragHandles.has(handle)) return
-  boundDragHandles.add(handle)
-  handle.addEventListener('pointerdown', event => {
-    const cardId = event.currentTarget.dataset.dragCard
-    const card = event.currentTarget.closest('.thread-card')
-    if (cardId === undefined || !(card instanceof HTMLElement)) return
-    event.preventDefault()
-    const origin = { x: event.clientX, y: event.clientY, position: { x: Number.parseFloat(card.style.left), y: Number.parseFloat(card.style.top) } }
-    const aliases = card.dataset.positionKey === undefined ? [] : [card.dataset.positionKey]
-    let position = origin.position
-    let stopped = false
-    let frame = 0
-    state.dragging = true
-    // Coalesce pointermove updates to one DOM pass per animation frame so a
-    // high report-rate pointer cannot queue a reflow per event.
-    const apply = () => {
-      frame = 0
-      state.cardPositions.set(cardId, { x: Math.round(position.x), y: Math.round(position.y) })
-      for (const alias of aliases) state.cardPositions.set(alias, { x: Math.round(position.x), y: Math.round(position.y) })
-      // Keep the virtualized data object in sync so viewport visibility and
-      // connector paths track the live drag position.
-      const dataCard = state.canvasCardsById?.get(cardId)
-      if (dataCard !== undefined) dataCard.position = { x: position.x, y: position.y }
+const DRAG_THRESHOLD = 5 // Screen pixels, independent of canvas zoom.
+let canvasTool = 'select'
+let spacePan = false
+let activeCanvasGesture = null
+let suppressCanvasClick = false
+
+function syncCanvasInteraction() {
+  const viewport = document.querySelector('.canvas-viewport')
+  if (viewport instanceof HTMLElement) viewport.classList.toggle('pan-tool', canvasTool === 'pan' || spacePan)
+  for (const button of app.querySelectorAll('[data-canvas-tool]')) {
+    button.setAttribute('aria-pressed', String(button.dataset.canvasTool === canvasTool))
+  }
+}
+
+function resetCanvasInteraction() {
+  activeCanvasGesture?.stop(true)
+  spacePan = false
+  closeCanvasMenu({ restoreFocus: false })
+  syncCanvasInteraction()
+}
+
+function setCanvasTool(tool) {
+  if (activeCanvasGesture !== null || !['select', 'pan'].includes(tool)) return
+  canvasTool = tool
+  syncCanvasInteraction()
+}
+
+// One owner per pointer gesture; capture only after the threshold so a title
+// click retains its original target. No per-card listeners or polling renders.
+function beginCanvasGesture(event, viewport, card = null) {
+  if (activeCanvasGesture !== null) return
+  cancelCanvasZoom()
+  const owner = card ?? viewport
+  const cardId = card?.dataset.cardId
+  const dataCard = cardId === undefined ? undefined : state.canvasCardsById?.get(cardId)
+  const original = card === null ? { ...state.canvasCamera }
+    : { x: Number.parseFloat(card.style.left), y: Number.parseFloat(card.style.top) }
+  if (!Number.isFinite(original.x) || !Number.isFinite(original.y)) return
+  const origin = { x: event.clientX, y: event.clientY, zoom: state.zoom }
+  let position = original
+  let moved = false
+  let frame = 0
+  let stopped = false
+  state.dragging = card !== null
+  state.canvasGesture = card === null
+  const apply = () => {
+    frame = 0
+    if (card === null) {
+      state.canvasCamera = position
+      applyCanvasTransform()
+      syncCanvasViewport()
+    } else {
+      if (dataCard !== undefined) dataCard.position = { ...position }
       card.style.left = `${position.x}px`
       card.style.top = `${position.y}px`
       refreshCardConnectors(cardId)
     }
-    const move = moveEvent => {
-      position = { x: origin.position.x + (moveEvent.clientX - origin.x) / state.zoom, y: origin.position.y + (moveEvent.clientY - origin.y) / state.zoom }
-      if (frame === 0) frame = window.requestAnimationFrame(apply)
+  }
+  const move = next => {
+    if (next.pointerId !== event.pointerId) return
+    const dx = next.clientX - origin.x
+    const dy = next.clientY - origin.y
+    if (!moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return
+    if (!moved) {
+      moved = true
+      suppressCanvasClick = true
+      if (next.type !== 'pointerup') owner.setPointerCapture(event.pointerId)
+      viewport.classList.add(card === null ? 'is-panning' : 'is-card-dragging')
     }
-    const stop = () => {
-      if (stopped) return
-      stopped = true
-      document.removeEventListener('pointermove', move)
-      document.removeEventListener('pointerup', stop)
-      document.removeEventListener('pointercancel', stop)
-      if (frame !== 0) { window.cancelAnimationFrame(frame); frame = 0 }
+    const scale = card === null ? 1 : origin.zoom
+    position = { x: original.x + dx / scale, y: original.y + dy / scale }
+    if (frame === 0) frame = window.requestAnimationFrame(apply)
+  }
+  const stop = (cancelled = false) => {
+    if (stopped) return
+    stopped = true
+    if (cancelled) suppressCanvasClick = true
+    document.removeEventListener('pointermove', move)
+    document.removeEventListener('pointerup', up)
+    document.removeEventListener('pointercancel', cancel)
+    owner.removeEventListener('lostpointercapture', cancel)
+    if (frame !== 0) window.cancelAnimationFrame(frame)
+    if (moved) {
+      if (cancelled) position = original
       apply()
-      rememberCardPosition(cardId, position, aliases)
-      const dataCard = state.canvasCardsById?.get(cardId)
-      if (dataCard) {
-        dataCard.positionLocked = true
-        canvasGraphCache?.index.set(dataCard)
+      if (card !== null) {
+        if (!cancelled) {
+          const aliases = card.dataset.positionKey === undefined ? [] : [card.dataset.positionKey]
+          rememberCardPosition(cardId, position, aliases)
+          if (dataCard !== undefined) dataCard.positionLocked = true
+        }
+        if (dataCard !== undefined) canvasGraphCache?.index.set(dataCard)
+        if (regionView) regionView.planKey = null
       }
-      if (regionView) regionView.planKey = null
-      state.dragging = false
-      deferCanvasRefresh(120)
-      syncCanvasViewport({ immediate: true })
-      // No full render: only the dragged card's inline position and its
-      // connectors changed; rebuilding the whole canvas on drop is the jank.
     }
-    document.addEventListener('pointermove', move)
-    document.addEventListener('pointerup', stop)
-    document.addEventListener('pointercancel', stop)
-  })
-}
-
-function installDragging() {
-  for (const handle of document.querySelectorAll('[data-drag-card]')) bindDragHandle(handle)
+    if (owner.hasPointerCapture(event.pointerId)) owner.releasePointerCapture(event.pointerId)
+    viewport.classList.remove('is-panning', 'is-card-dragging')
+    activeCanvasGesture = null
+    state.dragging = false
+    state.canvasGesture = false
+    deferCanvasRefresh(120)
+    syncCanvasViewport({ immediate: true })
+  }
+  const up = next => {
+    if (next.pointerId !== event.pointerId) return
+    move(next) // Include the final sample, even if no rAF ran before release.
+    stop()
+  }
+  const cancel = next => { if (next.pointerId === event.pointerId) stop(true) }
+  activeCanvasGesture = { stop }
+  document.addEventListener('pointermove', move)
+  document.addEventListener('pointerup', up)
+  document.addEventListener('pointercancel', cancel)
+  owner.addEventListener('lostpointercapture', cancel)
 }
 
 function canvasViewport(target) {
   return target instanceof Element ? target.closest('.canvas-viewport') : null
 }
 
-function zoomCanvas(viewport, nextZoom, clientX, clientY) {
+function syncCanvasZoomLabel() {
+  const button = document.querySelector('.canvas-zoom-label')
+  if (button === null) return
+  const value = `${Math.round(state.zoom * 100)}%`
+  const label = button.querySelector('[data-canvas-zoom-value]')
+  if (label !== null) label.textContent = value
+  button.setAttribute('aria-label', `缩放 ${value}，打开缩放与适配菜单`)
+}
+
+function zoomCanvas(viewport, nextZoom, clientX, clientY, anchor = null) {
   // 20% keeps a whole map readable as an overview; 400% is the detail ceiling.
-  const zoom = Math.min(4, Math.max(.2, Math.round(nextZoom * 100) / 100))
+  // Keep full precision internally; only the displayed percentage is rounded.
+  const zoom = Math.min(4, Math.max(.2, nextZoom))
   if (zoom === state.zoom) return
-  const bounds = viewport.getBoundingClientRect()
-  const localX = clientX - bounds.left
-  const localY = clientY - bounds.top
-  const worldX = (localX - state.canvasCamera.x) / state.zoom
-  const worldY = (localY - state.canvasCamera.y) / state.zoom
+  if (anchor === null) {
+    const bounds = viewport.getBoundingClientRect()
+    const localX = clientX - bounds.left
+    const localY = clientY - bounds.top
+    anchor = { localX, localY,
+      worldX: (localX - state.canvasCamera.x) / state.zoom,
+      worldY: (localY - state.canvasCamera.y) / state.zoom }
+  }
+  const { localX, localY, worldX, worldY } = anchor
   state.zoom = zoom
   state.canvasCamera = { x: localX - worldX * zoom, y: localY - worldY * zoom }
-  const content = viewport.querySelector('.canvas-content')
-  if (content instanceof HTMLElement) {
-    // Drop the composited layer before zooming: a cached will-change raster
-    // would be upscaled instead of re-rasterized, which was the original
-    // zoom-blur bug. will-change re-applies via .is-panning on the next pan.
-    content.style.willChange = 'auto'
-    applyCanvasTransform()
-    syncCanvasViewport()
-    window.requestAnimationFrame(() => { content.style.willChange = '' })
-  } else {
-    applyCanvasTransform()
-    syncCanvasViewport()
-  }
-  const label = document.querySelector('.canvas-zoom-label')
-  if (label !== null) label.textContent = `${Math.round(state.zoom * 100)}%`
+  // CSS promotes the canvas only during panning. Zoom does not retain a
+  // will-change raster or toggle compositing on every wheel event.
+  applyCanvasTransform()
+  syncCanvasViewport()
+  syncCanvasZoomLabel()
 }
 
 function zoomCanvasAtCenter(delta) {
+  cancelCanvasZoom()
   const viewport = document.querySelector('.canvas-viewport')
   if (!(viewport instanceof HTMLElement)) return
   const bounds = viewport.getBoundingClientRect()
   zoomCanvas(viewport, state.zoom + delta, bounds.left + bounds.width / 2, bounds.top + bounds.height / 2)
 }
 
+const WHEEL_ZOOM_RATE = .0015
+const WHEEL_LINE_PIXELS = 16
+const ZOOM_SMOOTHING_MS = 65
+let canvasZoomFrame = 0
+let canvasZoomAnimation = null
+let canvasPanFrame = 0
+let pendingWheelPan = null
+
+function cancelCanvasZoom() {
+  if (canvasZoomFrame !== 0) window.cancelAnimationFrame(canvasZoomFrame)
+  canvasZoomFrame = 0
+  canvasZoomAnimation = null
+  if (canvasPanFrame !== 0) window.cancelAnimationFrame(canvasPanFrame)
+  canvasPanFrame = 0
+  pendingWheelPan = null
+}
+
+function queueWheelPan(viewport, event) {
+  if (state.dragging || state.canvasGesture) return
+  const mode = event.deltaMode
+  const unitX = mode === 1 ? WHEEL_LINE_PIXELS : mode === 2 ? Math.max(1, viewport.clientWidth) : 1
+  const unitY = mode === 1 ? WHEEL_LINE_PIXELS : mode === 2 ? Math.max(1, viewport.clientHeight) : 1
+  let dx = Number.isFinite(event.deltaX) ? event.deltaX * unitX : 0
+  let dy = Number.isFinite(event.deltaY) ? event.deltaY * unitY : 0
+  // Some browsers already translate Shift+wheel to deltaX.
+  if (event.shiftKey && dx === 0) { dx = dy; dy = 0 }
+  if (dx === 0 && dy === 0) return
+  if (canvasZoomAnimation !== null || pendingWheelPan?.viewport !== viewport) cancelCanvasZoom()
+  pendingWheelPan ??= { viewport, dx: 0, dy: 0, workspaceId: state.workspace?.id, focusRevision: state.canvasFocusRevision }
+  pendingWheelPan.dx += dx
+  pendingWheelPan.dy += dy
+  deferCanvasRefresh(120)
+  if (canvasPanFrame === 0) canvasPanFrame = window.requestAnimationFrame(() => {
+    canvasPanFrame = 0
+    const pan = pendingWheelPan
+    pendingWheelPan = null
+    if (pan === null || !pan.viewport.isConnected || document.hidden || !state.mapVisible || state.mode !== 'canvas'
+      || state.dragging || state.canvasGesture || state.workspace?.id !== pan.workspaceId
+      || state.canvasFocusRevision !== pan.focusRevision) return
+    state.canvasCamera = { x: state.canvasCamera.x - pan.dx, y: state.canvasCamera.y - pan.dy }
+    applyCanvasTransform()
+    syncCanvasViewport()
+  })
+}
+
+function wheelZoomDelta(event, viewport) {
+  // Read deltaMode first: browsers may adapt deltaY's units when it is read.
+  const mode = event.deltaMode
+  const delta = event.deltaY
+  const unit = mode === 1 ? WHEEL_LINE_PIXELS : mode === 2 ? Math.max(1, viewport.clientHeight) : 1
+  const pixels = delta * unit
+  return Number.isFinite(pixels) ? pixels : 0
+}
+
+function queueWheelZoom(viewport, event) {
+  if (state.dragging || state.canvasGesture) return
+  const delta = wheelZoomDelta(event, viewport)
+  if (delta === 0) return
+  if (pendingWheelPan !== null) cancelCanvasZoom()
+  if (canvasZoomAnimation !== null && canvasZoomAnimation.viewport !== viewport) cancelCanvasZoom()
+  // Accumulate against the pending target, so high-rate input is not lost
+  // between frames. Multiplicative zoom feels consistent at every scale.
+  const base = canvasZoomAnimation?.targetZoom ?? state.zoom
+  const targetZoom = Math.min(4, Math.max(.2, base * Math.exp(-delta * WHEEL_ZOOM_RATE * ZOOM_SPEED_FACTORS[preferences.zoomSpeed])))
+  if (targetZoom === state.zoom) { cancelCanvasZoom(); return }
+  const bounds = viewport.getBoundingClientRect()
+  const localX = event.clientX - bounds.left
+  const localY = event.clientY - bounds.top
+  const anchor = { localX, localY,
+    worldX: (localX - state.canvasCamera.x) / state.zoom,
+    worldY: (localY - state.canvasCamera.y) / state.zoom }
+  deferCanvasRefresh(120)
+  if (window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches) {
+    cancelCanvasZoom()
+    zoomCanvas(viewport, targetZoom, event.clientX, event.clientY, anchor)
+    return
+  }
+  canvasZoomAnimation = { viewport, targetZoom, anchor,
+    lastTime: canvasZoomAnimation?.lastTime ?? performance.now(),
+    workspaceId: state.workspace?.id, focusRevision: state.canvasFocusRevision }
+  if (canvasZoomFrame === 0) canvasZoomFrame = window.requestAnimationFrame(advanceCanvasZoom)
+}
+
+function advanceCanvasZoom(time) {
+  canvasZoomFrame = 0
+  const animation = canvasZoomAnimation
+  if (animation === null) return
+  if (!animation.viewport.isConnected || document.hidden || !state.mapVisible || state.mode !== 'canvas'
+    || state.dragging || state.canvasGesture || state.workspace?.id !== animation.workspaceId
+    || state.canvasFocusRevision !== animation.focusRevision) {
+    cancelCanvasZoom()
+    return
+  }
+  // Ease in log space using elapsed time rather than a fixed amount per frame.
+  // A long frame is capped so resuming does not produce a sudden large jump.
+  const elapsed = Math.min(64, Math.max(0, time - animation.lastTime))
+  const distance = Math.log(animation.targetZoom / state.zoom)
+  const nextZoom = Math.abs(distance) < .001 ? animation.targetZoom
+    : state.zoom * Math.exp(distance * (1 - Math.exp(-elapsed / ZOOM_SMOOTHING_MS)))
+  animation.lastTime = time
+  deferCanvasRefresh(120)
+  zoomCanvas(animation.viewport, nextZoom, 0, 0, animation.anchor)
+  if (nextZoom === animation.targetZoom) {
+    cancelCanvasZoom()
+    syncCanvasViewport({ immediate: true })
+  } else canvasZoomFrame = window.requestAnimationFrame(advanceCanvasZoom)
+}
+
 function setCanvasFocus(threadId) {
   if (threadId === state.focusedThreadId) return false
   if (threadId !== null && !visibleThreads(state.workspace?.threads ?? []).some(thread => thread.id === threadId)) return false
+  resetCanvasInteraction()
+  cancelCanvasZoom()
   // Both scopes share the current camera and zoom. Switching only changes
   // visibility; invalidate queued centering from earlier navigation as well.
   state.focusedThreadId = threadId
@@ -2273,18 +3008,21 @@ function queueActiveCardFocus() {
   })
 }
 
-function focusActiveCard() {
+function focusActiveCard({ preferSelection = false } = {}) {
   const viewport = document.querySelector('.canvas-viewport')
   if (!(viewport instanceof HTMLElement)) return
+  cancelCanvasZoom()
   const cards = state.canvasCards
-  if (cards === undefined || cards.length === 0) return
+  if (cards === undefined) return
   // Drafts win over the active conversation's latest turn; fall back to the
   // first card. Cards may be unmounted (outside the viewport), so the focus
   // target comes from the data model, never from DOM queries.
   const draft = state.draft === null ? undefined
     : state.draft.kind === 'new' ? { position: { x: 86, y: 82 } } : draftPlacement(cards)
   const activeCards = state.activeId === null || state.activeId === undefined ? [] : cards.filter(card => card.dshThreadId === state.activeId)
-  const card = draft ?? activeCards.at(-1) ?? cards[0]
+  const selected = preferSelection ? cards.find(card => card.id === state.selectedCardId) : undefined
+  const card = selected ?? draft ?? activeCards.at(-1) ?? cards[0]
+  if (card === undefined) return
   const { x: left, y: top } = card.position
   const bounds = viewport.getBoundingClientRect()
   state.canvasCamera = {
@@ -2293,6 +3031,61 @@ function focusActiveCard() {
   }
   applyCanvasTransform()
   syncCanvasViewport()
+}
+
+function fitCanvasCards(selectedOnly = false) {
+  const viewport = document.querySelector('.canvas-viewport')
+  if (!(viewport instanceof HTMLElement)) return
+  const cards = selectedOnly ? (state.canvasCards ?? []).filter(card => card.id === state.selectedCardId) : state.canvasCards ?? []
+  if (cards.length === 0) return
+  // Read all cards in the current scope, including virtualized offscreen ones.
+  let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity
+  for (const card of cards) {
+    left = Math.min(left, card.position.x)
+    top = Math.min(top, card.position.y)
+    right = Math.max(right, card.position.x + CARD_WIDTH)
+    bottom = Math.max(bottom, card.position.y + CARD_HEIGHT)
+  }
+  const bounds = viewport.getBoundingClientRect()
+  const zoom = Math.min(4, Math.max(.2, Math.min(Math.max(1, bounds.width - 96) / (right - left), Math.max(1, bounds.height - 96) / (bottom - top))))
+  cancelCanvasZoom()
+  state.zoom = zoom
+  state.canvasCamera = { x: bounds.width / 2 - (left + right) / 2 * zoom, y: bounds.height / 2 - (top + bottom) / 2 * zoom }
+  applyCanvasTransform()
+  syncCanvasViewport({ immediate: true })
+  syncCanvasZoomLabel()
+}
+
+function openShortcutHelp() {
+  if (document.querySelector('dialog[open]')) return
+  resetCanvasInteraction()
+  cancelCanvasZoom()
+  const previous = document.activeElement
+  const dialog = document.createElement('dialog')
+  dialog.className = 'settings-dialog shortcut-dialog'
+  dialog.setAttribute('aria-labelledby', 'synapse-shortcuts-title')
+  const rows = [
+    ['V / H', '选择阅读 / 持续平移模式'],
+    ['Space + 左键拖动', '临时平移画布'],
+    ['中键拖动 / 空白处拖动', '平移画布'],
+    ['滚轮 / Shift + 滚轮', '纵向 / 横向平移（默认）'],
+    ['Ctrl / ⌘ + 滚轮', '以鼠标位置缩放；触控板捏合也可缩放'],
+    ['标题拖动 / 标题双击', '移动卡片 / 打开完整会话'],
+    ['+ / − / 0', '中心缩放 / 恢复 100%'],
+    ['Shift + 1 / Shift + 2', '适配当前范围 / 适配选中卡片'],
+    ['F', '居中选中卡片或当前会话末轮，保持缩放'],
+    ['Esc', '取消手势 → 关闭菜单或弹窗 → 输入框失焦 → 关闭阅读面板'],
+    ['Ctrl / ⌘ + Enter', '发送消息（默认 Enter 换行）'],
+    ['?', '打开此快捷键帮助'],
+  ]
+  dialog.innerHTML = `<header class="settings-head"><h2 id="synapse-shortcuts-title">操作与快捷键</h2><button type="button" aria-label="关闭快捷键帮助" autofocus>×</button></header><div class="settings-body"><table class="shortcut-table"><tbody>${rows.map(([keys, label]) => `<tr><th scope="row"><kbd>${escapeHtml(keys)}</kbd></th><td>${escapeHtml(label)}</td></tr>`).join('')}</tbody></table><p>地图快捷键仅在地图获得焦点时生效。正文可拖选文字、双击选词；单击卡片打开阅读面板。滚轮和发送方式可在设置中调整。离开地图请点击顶部「对话」。</p></div>`
+  dialog.querySelector('button').addEventListener('click', () => dialog.close())
+  dialog.addEventListener('close', () => {
+    dialog.remove()
+    if (state.mapVisible && previous instanceof HTMLElement && previous.isConnected) previous.focus({ preventScroll: true })
+  }, { once: true })
+  document.body.append(dialog)
+  dialog.showModal()
 }
 
 let selectionFollowup = null
@@ -2347,55 +3140,38 @@ function queueSelectionFollowup() {
 
 app.addEventListener('pointerdown', event => {
   const viewport = canvasViewport(event.target)
-  if (!(viewport instanceof HTMLElement) || event.target instanceof Element && event.target.closest('.thread-card, button, textarea, select')) return
-  event.preventDefault()
-  const origin = { x: event.clientX, y: event.clientY, camera: { ...state.canvasCamera } }
-  let pendingCamera = null
-  let frame = 0
-  state.canvasGesture = true
-  viewport.classList.add('is-panning')
-  viewport.setPointerCapture(event.pointerId)
-  const apply = () => {
-    frame = 0
-    if (pendingCamera === null) return
-    state.canvasCamera = pendingCamera
-    pendingCamera = null
-    applyCanvasTransform()
-    syncCanvasViewport()
-  }
-  const move = moveEvent => {
-    pendingCamera = {
-      x: origin.camera.x + moveEvent.clientX - origin.x,
-      y: origin.camera.y + moveEvent.clientY - origin.y,
-    }
-    if (frame === 0) frame = window.requestAnimationFrame(apply)
-  }
-  const stop = () => {
-    viewport.classList.remove('is-panning')
-    document.removeEventListener('pointermove', move)
-    document.removeEventListener('pointerup', stop)
-    document.removeEventListener('pointercancel', stop)
-    if (frame !== 0) { window.cancelAnimationFrame(frame); frame = 0 }
-    apply()
-    state.canvasGesture = false
-    deferCanvasRefresh(120)
-    syncCanvasViewport({ immediate: true })
-  }
-  document.addEventListener('pointermove', move)
-  document.addEventListener('pointerup', stop)
-  document.addEventListener('pointercancel', stop)
+  if (!(viewport instanceof HTMLElement) || !(event.target instanceof Element) || state.mode !== 'canvas'
+    || event.isPrimary === false || ![0, 1].includes(event.button) || activeCanvasGesture !== null) return
+  const target = event.target
+  if (isEditableTarget(target) || target.closest('form')) return
+  const card = target.closest('.thread-card')
+  const dragArea = target.closest('[data-drag-card], [data-card-drag-title]')
+  const control = target.closest('button, a, select, [role="button"]')
+  const pan = event.button === 1 || (event.button === 0 && (spacePan || canvasTool === 'pan'))
+    || (event.button === 0 && card === null && control === null)
+  if (pan || dragArea !== null) {
+    event.preventDefault()
+    viewport.focus({ preventScroll: true })
+    beginCanvasGesture(event, viewport, pan ? null : card)
+  } else if (control === null) viewport.focus({ preventScroll: true })
 })
 
 app.addEventListener('wheel', event => {
   const viewport = canvasViewport(event.target)
   if (!(viewport instanceof HTMLElement)) return
+  if (event.ctrlKey || event.metaKey) {
+    event.preventDefault()
+    queueWheelZoom(viewport, event)
+    return
+  }
   const card = event.target instanceof Element ? event.target.closest('.thread-card') : null
   if (card instanceof HTMLElement) {
+    cancelCanvasZoom()
     // Over a card the wheel scrolls that card's own answer with the browser's
     // native wheel (OS-smooth, never a page jump per notch); the answer's
     // overscroll-behavior: contain stops the scroll chaining into the canvas.
-    const answer = card.querySelector('.thread-answer')
-    if (answer instanceof HTMLElement && answer.scrollHeight > answer.clientHeight) {
+    const scroller = event.target.closest('.thread-answer, textarea, .draft-quick-editor')
+    if (scroller instanceof HTMLElement && scroller.scrollHeight > scroller.clientHeight) {
       deferCanvasRefresh()
       return
     }
@@ -2405,14 +3181,19 @@ app.addEventListener('wheel', event => {
     return
   }
   event.preventDefault()
-  zoomCanvas(viewport, state.zoom + (event.deltaY < 0 ? .05 : -.05), event.clientX, event.clientY)
+  if (preferences.wheelBehavior === 'zoom' && !event.shiftKey) queueWheelZoom(viewport, event)
+  else queueWheelPan(viewport, event)
 }, { passive: false })
 
 // Track pointer-down so the card click handler can tell a plain click from a
 // text-selection or drag gesture; acting on the latter would re-render and
 // wipe the user's selection.
 let pointerDownPosition = null
-app.addEventListener('pointerdown', event => { pointerDownPosition = { x: event.clientX, y: event.clientY } })
+app.addEventListener('pointerdown', event => {
+  if (activeCanvasGesture !== null) return
+  pointerDownPosition = { x: event.clientX, y: event.clientY }
+  suppressCanvasClick = false
+}, true)
 app.addEventListener('pointerdown', event => {
   const button = event.target instanceof Element ? event.target.closest('.selection-followup') : null
   if (button instanceof HTMLButtonElement) event.preventDefault()
@@ -2421,22 +3202,131 @@ app.addEventListener('pointerdown', event => {
 app.addEventListener('pointerup', queueSelectionFollowup)
 app.addEventListener('scroll', hideSelectionFollowup, true)
 document.addEventListener('selectionchange', queueSelectionFollowup)
+function isEditableTarget(target) {
+  return target instanceof Element && (target.closest('input, textarea, select') !== null || target.closest('[contenteditable]:not([contenteditable="false"])') !== null)
+}
+
+function handleMapEscape() {
+  if (!state.mapVisible) return false
+  if (activeCanvasGesture !== null) { resetCanvasInteraction(); return true }
+  if (canvasZoomAnimation !== null || pendingWheelPan !== null) { cancelCanvasZoom(); return true }
+  if (spacePan) { spacePan = false; syncCanvasInteraction(); return true }
+  if (activeCanvasMenu !== null) { closeCanvasMenu(); return true }
+  if (activeSelectMenu !== null) { closeSelectMenu(); return true }
+  const dialog = document.querySelector('dialog[open]')
+  if (dialog instanceof HTMLDialogElement) { dialog.close(); return true }
+  const input = document.activeElement
+  if (isEditableTarget(input)) {
+    input.blur()
+    document.querySelector('.canvas-viewport')?.focus({ preventScroll: true })
+    return true
+  }
+  if (state.mode === 'canvas' && state.inspectorCardId !== null) {
+    closeCardInspector({ animate: false })
+    document.querySelector('.canvas-viewport')?.focus({ preventScroll: true })
+    return true
+  }
+  return false
+}
+
 document.addEventListener('keydown', event => {
-  if (event.key !== 'Escape' || state.mode !== 'canvas' || state.inspectorCardId === null) return
+  if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || !state.mapVisible) return
+  if (event.key === 'Escape') {
+    if (handleMapEscape()) event.preventDefault()
+    return
+  }
+  const target = event.target
+  if (document.querySelector('dialog[open]') || activeSelectMenu !== null || activeCanvasMenu !== null || isEditableTarget(target)) return
+  const focused = document.activeElement
+  if (state.mode !== 'canvas' || !(focused instanceof Element) || focused.closest('.canvas-viewport, .canvas-controls') === null) return
+  // Space activates focused buttons; temporary panning belongs to the map.
+  if (event.key === ' ' && focused.closest('button, [role="button"]') !== null) return
+  if (event.ctrlKey || event.metaKey || event.altKey || activeCanvasGesture !== null) return
+  const key = event.key.toLowerCase()
+  if (key === ' ' && !event.repeat) { event.preventDefault(); spacePan = true; syncCanvasInteraction(); return }
+  if (key === ' ') { event.preventDefault(); return }
+  if (key === 'v' || key === 'h') { event.preventDefault(); setCanvasTool(key === 'v' ? 'select' : 'pan'); return }
+  if (key === '+' || key === '=' || key === '-' || key === '_') {
+    event.preventDefault()
+    zoomCanvasAtCenter(key === '+' || key === '=' ? .1 : -.1)
+  } else if (key === '0' && !event.shiftKey) {
+    event.preventDefault()
+    zoomCanvasAtCenter(1 - state.zoom)
+  } else if (event.shiftKey && (event.code === 'Digit1' || event.code === 'Digit2')) {
+    event.preventDefault()
+    fitCanvasCards(event.code === 'Digit2')
+  } else if (key === 'f') {
+    event.preventDefault()
+    focusActiveCard({ preferSelection: true })
+  } else if (key === '?') { event.preventDefault(); openShortcutHelp() }
+})
+document.addEventListener('keyup', event => {
+  if (event.code === 'Space' || event.key === ' ') { spacePan = false; syncCanvasInteraction() }
+})
+document.addEventListener('focusin', event => {
+  if (isEditableTarget(event.target)) { spacePan = false; syncCanvasInteraction() }
+})
+window.addEventListener('blur', resetCanvasInteraction)
+document.addEventListener('visibilitychange', () => { if (document.hidden) resetCanvasInteraction() })
+
+// Sending reuses the form submit path and its existing in-flight guard.
+const composingInputs = new WeakSet()
+app.addEventListener('compositionstart', event => { if (event.target instanceof HTMLTextAreaElement) composingInputs.add(event.target) })
+app.addEventListener('compositionend', event => { if (event.target instanceof HTMLTextAreaElement) composingInputs.delete(event.target) })
+app.addEventListener('keydown', event => {
+  const input = event.target
+  if (!(input instanceof HTMLTextAreaElement) || event.key !== 'Enter' || event.isComposing || event.keyCode === 229
+    || composingInputs.has(input) || input.disabled) return
+  const form = input.closest('form[data-draft], form[data-compose]')
+  if (!(form instanceof HTMLFormElement)) return
+  const modifierSend = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey
+  const enterSend = preferences.sendShortcut === 'enter' && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.altKey
+  if (!modifierSend && !enterSend) return
   event.preventDefault()
-  closeCardInspector({ animate: false })
+  if (!event.repeat && input.value.trim() !== '') form.requestSubmit()
+})
+
+app.addEventListener('dblclick', event => {
+  if (suppressCanvasClick || canvasTool === 'pan' || spacePan || state.mode !== 'canvas') return
+  const title = event.target instanceof Element ? event.target.closest('.thread-title[data-action="select-card"]') : null
+  if (!(title instanceof HTMLElement)) return
+  const thread = state.workspace?.threads.find(item => item.id === title.dataset.thread)
+  if (thread === undefined) return
+  event.preventDefault()
+  cancelCanvasZoom()
+  state.activeId = thread.id
+  state.mode = 'thread'
+  state.detailTargetCardId = title.dataset.card ?? null
+  render()
+  void loadThreadHistory(thread)
+})
+
+app.addEventListener('auxclick', event => {
+  if (event.button === 1 && canvasViewport(event.target) !== null) event.preventDefault()
 })
 
 app.addEventListener('click', async event => {
+  if (event.target instanceof Element && canvasViewport(event.target) !== null && event.detail > 0
+    && (suppressCanvasClick || (event.target.closest('.thread-card') !== null && (spacePan || canvasTool === 'pan')))) return
   const button = event.target.closest('[data-action]')
-  if (!(button instanceof HTMLElement)) {
+  if (!(button instanceof HTMLElement) || button.dataset.action === 'select-card') {
     const card = event.target instanceof Element ? event.target.closest('.thread-card[data-thread]:not(.draft-card)') : null
-    if (!(card instanceof HTMLElement) || event.target instanceof Element && event.target.closest('.node-handle, textarea, select, form')) return
+    if (!(card instanceof HTMLElement)) {
+      const viewport = canvasViewport(event.target)
+      if (viewport instanceof HTMLElement && state.mode === 'canvas' && event.detail <= 1) {
+        state.selectedCardId = null
+        state.inspectorCardId = null
+        state.inspectorOpening = false
+        render()
+      }
+      return
+    }
+    if (event.target instanceof Element && event.target.closest('.node-handle, textarea, select, form, a')) return
     // A double-click selects a word and a drag selects a range; neither is a
     // select-click, so leave the selection intact instead of re-rendering.
     if (event.detail > 1) return
-    if (pointerDownPosition !== null
-      && Math.hypot(event.clientX - pointerDownPosition.x, event.clientY - pointerDownPosition.y) > 4) return
+    if (event.detail > 0 && pointerDownPosition !== null
+      && Math.hypot(event.clientX - pointerDownPosition.x, event.clientY - pointerDownPosition.y) >= DRAG_THRESHOLD) return
     const thread = state.workspace?.threads.find(item => item.id === card.dataset.thread)
     if (thread === undefined) return
     const cardId = card.dataset.cardId
@@ -2457,6 +3347,9 @@ app.addEventListener('click', async event => {
   }
   const thread = state.workspace?.threads.find(item => item.id === button.dataset.thread)
   try {
+    if (button.dataset.action === 'open-settings') { openSettings(); return }
+    if (performCanvasAction(button.dataset.action)) return
+    if (button.dataset.action === 'canvas-tool') { setCanvasTool(button.dataset.canvasTool); return }
     if (button.dataset.action === 'follow-selection') {
       const followup = selectionFollowup
       hideSelectionFollowup()
@@ -2518,7 +3411,7 @@ app.addEventListener('click', async event => {
     }
     if (button.dataset.action === 'detail-prev' && thread !== undefined) changeDetailPage(thread, -1)
     if (button.dataset.action === 'detail-next' && thread !== undefined) changeDetailPage(thread, 1)
-    if (button.dataset.action === 'show-thread' && thread !== undefined) { state.activeId = thread.id; state.mode = 'thread'; state.detailTargetCardId = button.dataset.card ?? null; render(); void loadThreadHistory(thread) }
+    if (button.dataset.action === 'show-thread' && thread !== undefined) { cancelCanvasZoom(); state.activeId = thread.id; state.mode = 'thread'; state.detailTargetCardId = button.dataset.card ?? null; render(); void loadThreadHistory(thread) }
     if (button.dataset.action === 'show-canvas') { state.mode = 'canvas'; render() }
     if (button.dataset.action === 'toggle-card-children' && button.dataset.card !== undefined) {
       const cardId = button.dataset.card
@@ -2552,20 +3445,12 @@ app.addEventListener('click', async event => {
     if (button.dataset.action === 'toggle-message' && button.dataset.message !== undefined) { state.expandedMessageIds.has(button.dataset.message) ? state.expandedMessageIds.delete(button.dataset.message) : state.expandedMessageIds.add(button.dataset.message); renderPreservingDetailScroll() }
     if (button.dataset.action === 'open-dsh' && thread?.dshSessionId !== null) post('synapse:open-session', { sessionId: thread.dshSessionId, seq: Number.isInteger(Number(button.dataset.seq)) ? Number(button.dataset.seq) : undefined })
     if (button.dataset.action === 'archive-thread' && thread !== undefined) await archiveThread(thread)
-    if (button.dataset.action === 'zoom-in') zoomCanvasAtCenter(.1)
-    if (button.dataset.action === 'zoom-out') zoomCanvasAtCenter(-.1)
-    if (button.dataset.action === 'focus-active') focusActiveCard()
     if (button.dataset.action === 'focus-thread' || button.dataset.action === 'show-workspace') {
       if (state.draft !== null) return setError('请先完成或取消正在编辑的追问或分支')
       if (button.dataset.action === 'focus-thread' && state.focusedThreadId !== null) return
       if (setCanvasFocus(button.dataset.action === 'show-workspace' ? null : state.activeId)) render()
     }
     if (button.dataset.action === 'dismiss-error') { state.error = ''; render() }
-    if (button.dataset.action === 'layout' && state.workspace !== null) {
-      resetCardPositions()
-      resetCanvasCamera()
-      render()
-    }
   } catch (error) { setError(error) }
 })
 
@@ -2611,6 +3496,7 @@ app.addEventListener('submit', event => {
 window.addEventListener('message', event => {
   if (event.origin !== window.location.origin || event.data?.source !== 'dsh-synapse') return
   const data = event.data
+  if (data.type === 'synapse:escape') handleMapEscape()
   if (data.type === 'synapse:map-opened') {
     state.mapVisible = true
     // Do NOT reset the camera here: toggling dialog<->map for the same
@@ -2619,12 +3505,14 @@ window.addEventListener('message', event => {
     // re-centers in the current-session handler below.
     state.mode = 'canvas'
     render()
+    document.querySelector('.canvas-viewport')?.focus({ preventScroll: true })
     window.requestAnimationFrame(() => post('synapse:map-ready'))
   }
   if (data.type === 'synapse:map-closed') pauseMapBodies()
   if (data.type === 'synapse:map-visible') { state.mapVisible = true; render() }
   if (data.type === 'synapse:theme') {
-    document.documentElement.dataset.theme = data.dark === true ? 'dark' : 'light'
+    hostTheme = data.dark === true ? 'dark' : 'light'
+    applyPreferences()
   }
   if (data.type === 'synapse:workspaces') {
     const nextWorkspaces = Array.isArray(data.workspaces) ? data.workspaces.filter(workspace => typeof workspace?.id === 'string' && typeof workspace.title === 'string' && Array.isArray(workspace.sessionIds)) : []
