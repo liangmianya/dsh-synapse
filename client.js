@@ -473,7 +473,14 @@ window.__ModuleLoader__.load({
           }).catch(() => { send('synapse:bridge-error', { requestId: event.data.requestId, message: 'DSH 会话创建失败，请先在 DSH 选择工作目录' }) })
         }
       }
-      const onKeyDown = event => { if (event.key === 'Escape' && !overlay.hidden) close() }
+      const onKeyDown = event => {
+        // Escape is owned by the map even while the host switch has focus.
+        // Forward it to the iframe's ordered dismiss path; leave via the pill.
+        if (event.key === 'Escape' && !event.defaultPrevented && !event.isComposing && event.keyCode !== 229 && !overlay.hidden) {
+          event.preventDefault()
+          send('synapse:escape')
+        }
+      }
       // Follow DSH's live theme switch: body[data-ds-dark-theme] is the web
       // client's dark-mode signal, mirrored into the map iframe via synapse:theme.
       const themeObserver = typeof MutationObserver === 'undefined'
