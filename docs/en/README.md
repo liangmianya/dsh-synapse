@@ -144,6 +144,15 @@ Settings at the bottom of the sidebar provide wheel behavior, zoom speed, send s
 
 ## Recent changes
 
+**0.5.11 · 2026-11-24**
+
+- Moved the scope controls to the canvas top-right; they make room for the reading panel and no longer sit in the host title-bar drag/click band.
+- The sidebar toggle uses the host's own control. When fullscreen covers it, a proxy in the sidebar brand row calls the host layout service.
+- Windowed mode leaves the host's 0–76px header drag area untouched; the no-drag hole is used only when the fullscreen overlay covers the host header.
+- Fast drags ending with pointercancel, lostpointercapture, or window blur commit at the current position instead of snapping back; Escape or a hidden window still restores.
+- Fixed the "open in DSH / locate" anchor throwing for non-running sessions or turns outside the loaded window; it refreshes the chat target and pages through `binding.session.loadThrough`.
+- The cross-process lock uses PID + token; a losing writer neither writes nor deletes the winner's lock, and failed saves keep dirty state and retry.
+
 **0.5.10 · 2026-11-23**
 
 - Removed the outline around the canvas when it receives focus.

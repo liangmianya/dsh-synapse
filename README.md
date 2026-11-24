@@ -37,7 +37,7 @@
 - **自检口诀：装完顶部看不到「会话地图」开关，就是装到另一套去了**，把 `--profile` 换成另一套的名字再装一次即可。
 - 桌面 App 装完需要**重启 App**（Host 侧插件在启动时加载）；命令行装的，重启 `dsh web` 并刷新页面。
 
-`dsh` 是 DSH 运行时自带的 launcher，位于 App 安装目录的 `resources\runtime\cli\bin\dsh.cmd`。先确认它能调用：
+`dsh` 是 DSH 运行时自带的 launcher，位于 App 安装目录的 `resources\runtime\cli\bin\dsh.cmd`。macOS 下是 `DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh`，命令相同，不需要 `.cmd`。先确认它能调用：
 
 ```powershell
 dsh --version
@@ -106,9 +106,30 @@ location /dsh/ {
 | Esc | 依次取消手势或未完成的镜头动画、关闭菜单或弹窗、输入框失焦、关闭阅读面板 |
 | Ctrl / ⌘ + Enter | 发送消息，默认 Enter 换行 |
 
-地图快捷键仅在画布或画布工具栏获得焦点、没有输入框或弹窗占用时生效。发送方式可在设置中切换为 Enter 发送、Shift + Enter 换行；组合输入期间不会触发发送。Esc 保留未发送文字，离开地图请点击顶部「对话」开关。失焦、隐藏和取消手势会清理监听与捕获；取消卡片拖拽恢复原位置。
+地图快捷键仅在画布或画布工具栏获得焦点、没有输入框或弹窗占用时生效。发送方式可在设置中切换为 Enter 发送、Shift + Enter 换行；组合输入期间不会触发发送。Esc 保留未发送文字，离开地图请点击顶部「对话」开关。失焦、隐藏和取消手势会清理监听与捕获。Esc 或窗口隐藏会恢复卡片原位；快速拖拽结束时的 pointercancel / 窗口失焦按当前位置落定，避免回弹。
 
 ## 最近更新
+
+**0.5.11 · 2026-11-24**
+
+**macOS 窗口与顶栏**
+
+- 「全工作区 / 聚焦会话 / …」移到画布右上角；打开右侧详情面板时自动左移让位，不再挤在宿主标题栏的拖拽/点击带里。
+- 侧边栏收起/展开改用宿主自己的开关；宿主开关被全屏覆盖时，插件在侧栏品牌行提供代理按钮，并调用宿主 layout 服务，状态只有宿主一份。
+- 窗口模式不再修改宿主 header 的拖拽区域，0–76px 拖拽保持原样；只有全屏 overlay 覆盖宿主 header 时才保留 0–76px 的 no-drag 洞。
+- 快速拖拽结束、pointercancel、lostpointercapture 或窗口失焦时按当前位置落定，不再弹回起点；Esc 或窗口隐藏仍恢复原位置。
+
+**历史跳转**
+
+- 修复「在 DSH 中打开 / 定位」在非运行会话或目标轮次未加载时访问 `record.chat` / `record.session` 抛异常的问题。
+- 现在会先刷新 chat target，再通过 `binding.session.loadThrough` 翻页并重试；新增目标轮次未加载、chat 未就绪的测试。
+
+**文件锁**
+
+- 跨进程锁改为 PID + token；拿不到锁的实例不再写入，也不再删除别人的锁。
+- 保存失败保留 dirty 并在 2 秒后重试；新增双写入者和 stale lock 测试。
+
+Node.js `>= 22.19.0`、DeepSeek Harness `>= 0.1.7-rc.2` 的要求不变。安装或升级后需重启 DSH。
 
 **0.5.10 · 2026-11-23**
 

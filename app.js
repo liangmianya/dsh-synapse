@@ -105,7 +105,7 @@ const MAP_FACE_TEXT = 2400
 const OVERVIEW_ZOOM = .55
 const DETAIL_PAGE_MESSAGES = 40
 const state = {
-  summaries: [], workspace: null, activeId: null, selectedCardId: null, mode: 'canvas', zoom: 1, currentDsh: null, sidebarCollapsed: false,
+  summaries: [], workspace: null, activeId: null, selectedCardId: null, mode: 'canvas', zoom: 1, currentDsh: null, sidebarCollapsed: false, hostToggleVisible: true,
   focusedThreadId: null, canvasFocusRevision: 0,
   dshWorkspaces: [], selectedDshWorkspaceId: null,
   historyBySession: new Map(), historyRequests: new Map(), pendingReplies: new Map(), pendingRpc: new Map(), liveReplies: new Map(),
@@ -2181,7 +2181,9 @@ function renderCanvas() {
   const focusedThread = threads.find(thread => thread.id === state.focusedThreadId)
   const focusLabel = focusedThread === undefined ? '' : `<div class="canvas-focus-label" title="${escapeHtml(threadListTitle(focusedThread))}"><strong>聚焦：${escapeHtml(threadListTitle(focusedThread))}</strong><span>含派生分支</span></div>`
   const focusEmpty = focusedThread !== undefined && cards.length === 0 ? '<div class="canvas-focus-empty">该会话及其分支还没有可显示的对话。</div>' : ''
-  return `<section class="canvas-view" data-morph-key="canvas"><div class="canvas-viewport" tabindex="0" role="region" aria-label="会话地图，按问号查看快捷键"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors" data-morph-key="links:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></svg><div class="cards-layer" data-morph-key="cards:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></div></div></div>${focusLabel}${focusEmpty}<div class="region-status" role="status" hidden><i aria-hidden="true"></i><span></span><button type="button" data-action="retry-bodies" hidden>重试</button></div>${canvasBottomControls()}${inspector}</section>`
+  const canvasTopControls = `<div class="canvas-controls canvas-top-controls" data-morph-key="canvas-top-controls">${canvasScopeControls(threads)}
+    <button type="button" class="canvas-more-button" data-morph-key="canvas-more-menu" data-canvas-menu="more" title="更多画布操作" aria-label="更多画布操作" aria-haspopup="menu" aria-controls="synapse-canvas-more-menu" aria-expanded="${activeCanvasMenu?.kind === 'more'}"><svg aria-hidden="true" viewBox="0 0 16 16"><circle cx="3" cy="8" r=".8"/><circle cx="8" cy="8" r=".8"/><circle cx="13" cy="8" r=".8"/></svg></button></div>`
+  return `<section class="canvas-view" data-morph-key="canvas">${canvasTopControls}<div class="canvas-viewport" tabindex="0" role="region" aria-label="会话地图，按问号查看快捷键"><div class="canvas-content" style="transform:translate(${state.canvasCamera.x}px, ${state.canvasCamera.y}px) scale(${state.zoom})"><svg class="connectors" data-morph-key="links:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></svg><div class="cards-layer" data-morph-key="cards:${escapeHtml(state.workspace?.id ?? '')}" data-region-layer></div></div></div>${focusLabel}${focusEmpty}<div class="region-status" role="status" hidden><i aria-hidden="true"></i><span></span><button type="button" data-action="retry-bodies" hidden>重试</button></div>${canvasBottomControls()}${inspector}</section>`
 }
 
 function isProcessMessage(message) {
@@ -2397,20 +2399,18 @@ function render() {
   const view = state.mode === 'thread' ? renderThread() : renderCanvas()
   const choices = workspaceChoices()
   const selectedWorkspaceId = state.selectedDshWorkspaceId ?? workspace?.id
-  const canvasControls = state.mode === 'canvas' ? `<div class="canvas-controls canvas-top-controls" data-morph-key="canvas-top-controls">${canvasScopeControls(threads)}
-    <button type="button" class="canvas-more-button" data-morph-key="canvas-more-menu" data-canvas-menu="more" title="更多画布操作" aria-label="更多画布操作" aria-haspopup="menu" aria-controls="synapse-canvas-more-menu" aria-expanded="${activeCanvasMenu?.kind === 'more'}"><svg aria-hidden="true" viewBox="0 0 16 16"><circle cx="3" cy="8" r=".8"/><circle cx="8" cy="8" r=".8"/><circle cx="13" cy="8" r=".8"/></svg></button></div>` : ''
   const detailAvailable = currentThread() !== null
   const canvasTabs = `<nav class="canvas-tabs" aria-label="会话地图视图"><button class="${state.mode === 'canvas' ? 'active' : ''}" data-action="show-canvas">地图</button><button class="${state.mode === 'thread' ? 'active' : ''}" data-action="show-thread" data-thread="${state.activeId ?? ''}" ${detailAvailable ? '' : 'disabled'}>详情</button></nav>`
   morphInto(app, `<main class="synapse-shell ${state.sidebarCollapsed ? 'sidebar-collapsed' : ''}">
     <aside class="sidebar">
-      <div class="sidebar-brand-row"><div class="brand" aria-label="Synapse"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 32 32" fill="none"><path d="M9 10.5 16 7l7 3.5M9 10.5v8L16 22m0-15v15m7-11.5v8L16 22"/><circle cx="9" cy="10" r="2.5"/><circle cx="23" cy="10" r="2.5"/><circle cx="16" cy="23" r="2.5"/></svg><strong>Synapse</strong></div><button class="sidebar-toggle" type="button" data-action="toggle-sidebar" aria-label="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}" title="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.25"/><path d="M6 2v12"/></svg></button></div>
+      <div class="sidebar-brand-row"><div class="brand" aria-label="Synapse"><svg class="brand-mark" aria-hidden="true" viewBox="0 0 32 32" fill="none"><path d="M9 10.5 16 7l7 3.5M9 10.5v8L16 22m0-15v15m7-11.5v8L16 22"/><circle cx="9" cy="10" r="2.5"/><circle cx="23" cy="10" r="2.5"/><circle cx="16" cy="23" r="2.5"/></svg><strong>Synapse</strong></div>${state.hostToggleVisible ? '' : `<button class="sidebar-toggle" type="button" data-action="toggle-host-sidebar" aria-label="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}" title="${state.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="1.75" width="12.5" height="12.5" rx="2.25"/><path d="M6 2v12"/></svg></button>`}</div>
       <button class="new-workspace" type="button" data-action="create-session" ${state.draft !== null ? 'disabled' : ''}><svg class="new-session-icon" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v6.5M4.75 8h6.5"/></svg><span>新会话</span></button>
       <div class="workspace-label"><span>工作区</span><span class="workspace-select"><svg class="workspace-folder-icon" aria-hidden="true" viewBox="0 0 16 16"><path d="M2.5 4.75h3l1.2 1.5h6.8v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"/></svg>${styledSelect({ id: 'synapse-workspace-select', label: '选择工作区', value: selectedWorkspaceId, disabled: state.draft !== null, attributes: 'data-action="select-workspace"', options: choices.map(item => ({ value: item.id, label: item.title, title: item.path ?? item.title })) })}</span></div>
       <div class="sidebar-heading"><span>会话</span></div>
       <nav class="thread-tree">${threads.map(thread => `<button class="tree-row ${thread.id === state.activeId ? 'active' : ''}" data-action="select-thread" data-thread="${thread.id}" style="--thread-color:#374151"><span class="tree-dot"></span><span>${escapeHtml(threadListTitle(thread))}</span>${thread.parentId === null ? '' : '<i>分支</i>'}</button>`).join('') || '<p class="tree-empty">暂未同步会话</p>'}</nav>
       <footer class="sidebar-footer">${settingsButton()}</footer>
     </aside>
-    <header class="topbar">${canvasControls}${settingsButton(true)}</header><section class="main-stage">${state.error ? `<div class="status-message" role="alert"><span>${escapeHtml(state.error)}</span><button data-action="dismiss-error" aria-label="关闭" title="关闭">×</button></div>` : ''}${canvasTabs}${view}${selectionFollowupButton()}</section>
+    <header class="topbar" aria-hidden="true"></header><section class="main-stage">${state.error ? `<div class="status-message" role="alert"><span>${escapeHtml(state.error)}</span><button data-action="dismiss-error" aria-label="关闭" title="关闭">×</button></div>` : ''}${canvasTabs}${view}${selectionFollowupButton()}</section>
   </main>`)
   syncSelectControls(app)
   syncCanvasMenus()
@@ -2778,7 +2778,7 @@ function beginCanvasGesture(event, viewport, card = null) {
     document.removeEventListener('pointermove', move)
     document.removeEventListener('pointerup', up)
     document.removeEventListener('pointercancel', cancel)
-    owner.removeEventListener('lostpointercapture', cancel)
+    owner.removeEventListener('lostpointercapture', lost)
     if (frame !== 0) window.cancelAnimationFrame(frame)
     if (moved) {
       if (cancelled) position = original
@@ -2806,12 +2806,17 @@ function beginCanvasGesture(event, viewport, card = null) {
     move(next) // Include the final sample, even if no rAF ran before release.
     stop()
   }
-  const cancel = next => { if (next.pointerId === event.pointerId) stop(true) }
+  // Browser-initiated cancellation (macOS/Electron drops pointer capture on a
+  // fast release) is not a user cancel. Commit the last position instead of
+  // restoring the pre-drag one; Esc, blur and hidden-window still call
+  // stop(true) through resetCanvasInteraction().
+  const cancel = next => { if (next.pointerId === event.pointerId) stop() }
+  const lost = next => { if (next.pointerId === event.pointerId) stop() }
   activeCanvasGesture = { stop }
   document.addEventListener('pointermove', move)
   document.addEventListener('pointerup', up)
   document.addEventListener('pointercancel', cancel)
-  owner.addEventListener('lostpointercapture', cancel)
+  owner.addEventListener('lostpointercapture', lost)
 }
 
 function canvasViewport(target) {
@@ -3266,7 +3271,17 @@ document.addEventListener('keyup', event => {
 document.addEventListener('focusin', event => {
   if (isEditableTarget(event.target)) { spacePan = false; syncCanvasInteraction() }
 })
-window.addEventListener('blur', resetCanvasInteraction)
+window.addEventListener('blur', () => {
+  // A release can move focus out of the iframe while a drag is still active.
+  // Finish the gesture at its current position; Escape and a hidden window
+  // still go through resetCanvasInteraction() and restore the original one.
+  if (activeCanvasGesture !== null) {
+    activeCanvasGesture.stop()
+    resetCanvasInteraction()
+    return
+  }
+  resetCanvasInteraction()
+})
 document.addEventListener('visibilitychange', () => { if (document.hidden) resetCanvasInteraction() })
 
 // Sending reuses the form submit path and its existing in-flight guard.
@@ -3383,7 +3398,7 @@ app.addEventListener('click', async event => {
       updateRegionStatus()
       return
     }
-    if (button.dataset.action === 'toggle-sidebar') { state.sidebarCollapsed = !state.sidebarCollapsed; render() }
+    if (button.dataset.action === 'toggle-host-sidebar') { post('synapse:toggle-host-sidebar'); return }
     if (button.dataset.action === 'create-session') openNewSession()
     if (button.dataset.action === 'open-current' && state.currentDsh !== null) post('synapse:open-session', { sessionId: state.currentDsh.id })
     if (button.dataset.action === 'select-thread' && thread !== undefined) {
@@ -3497,6 +3512,16 @@ window.addEventListener('message', event => {
   if (event.origin !== window.location.origin || event.data?.source !== 'dsh-synapse') return
   const data = event.data
   if (data.type === 'synapse:escape') handleMapEscape()
+  if (data.type === 'synapse:host-sidebar') {
+    const next = data.collapsed === true
+    if (state.sidebarCollapsed !== next) { state.sidebarCollapsed = next; render() }
+    return
+  }
+  if (data.type === 'synapse:host-chrome') {
+    const visible = data.hostToggleVisible !== false
+    if (state.hostToggleVisible !== visible) { state.hostToggleVisible = visible; render() }
+    return
+  }
   if (data.type === 'synapse:map-opened') {
     state.mapVisible = true
     // Do NOT reset the camera here: toggling dialog<->map for the same

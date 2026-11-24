@@ -1,7 +1,7 @@
 {
   "name": "dsh-synapse",
-  "version": "0.5.10",
-  "synapseBuild": "release-0.5.10",
+  "version": "0.5.11",
+  "synapseBuild": "release-0.5.11",
   "description": "A visual, non-linear conversation workspace plugin for DeepSeek Harness.",
   "type": "module",
   "main": "index.js",
@@ -43,7 +43,8 @@
         "@deepseek-ai/dsh-api-session-controller",
         "@deepseek-ai/dsh-api-workspace-controller",
         "@deepseek-ai/dsh-client-ui-conversation",
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-layout"
       ],
       "immediately": false
     }

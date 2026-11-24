@@ -160,7 +160,7 @@ async function loadBridge(options = {}) {
       sessionListeners.add(listener)
       return () => sessionListeners.delete(listener)
     },
-    loadThrough: async () => {},
+    loadThrough: options.loadThrough ?? (async () => {}),
     prompt: async (content, mode) => {
       record(calls.prompts, { id, content, mode })
       return { ok: true }
@@ -277,10 +277,18 @@ async function loadBridge(options = {}) {
   }
 
   class HTMLElement {}
+  class MutationObserver {
+    constructor(callback) { this.callback = callback }
+    observe() {}
+    disconnect() {}
+  }
   let anchorScrolled = false
+  const documentElement = element('html')
+  documentElement.hasAttribute = () => false
   const documentStub = {
     head: element('head'),
     body: element('body'),
+    documentElement,
     createElement: tagName => element(tagName),
     querySelector: selector => options.anchorKey !== undefined && selector.includes(options.anchorKey)
       ? Object.assign(new HTMLElement(), { scrollIntoView: () => { anchorScrolled = true } })
@@ -306,6 +314,8 @@ async function loadBridge(options = {}) {
     removeEventListener: type => { windowListeners.delete(type) },
     // The bridge's only timers are the overlay-open fallback and the anchor
     // retry, so running them inline keeps the test deterministic.
+    innerWidth: 1024,
+    innerHeight: 768,
     setTimeout: callback => { callback(); return 1 },
     clearTimeout: () => {},
     requestAnimationFrame: callback => { callback(); return 1 },
@@ -320,6 +330,8 @@ async function loadBridge(options = {}) {
     fetch: async (url, init) => { record(calls.fetches, { url, body: JSON.parse(init.body) }); return { ok: true } },
     CSS: { escape: value => value },
     HTMLElement,
+    MutationObserver,
+    getComputedStyle: () => ({ getPropertyValue: () => '' }),
     console,
   }
   // The registration facade the Host shell provides: it only captures the lazy
@@ -364,7 +376,7 @@ async function loadBridge(options = {}) {
 test('declares the v0.1.7 Client services it calls', async () => {
   const bridge = await loadBridge()
 
-  assert.deepEqual(bridge.inject, ['sessions', 'workspaces', 'uiWorkspace', 'uiConversation'])
+  assert.deepEqual(bridge.inject, ['sessions', 'workspaces', 'uiWorkspace', 'uiConversation', 'layout'])
 })
 
 test('mounts one switch and one hidden map overlay into the page', async () => {
@@ -452,6 +464,31 @@ test('opens a session and closes the map without a controller-level open call', 
 
   assert.deepEqual(bridge.calls.opened, ['session-target'])
   assert.equal(bridge.overlay().hidden, true)
+})
+
+test('pages history and scrolls when the requested turn is outside the loaded window', async () => {
+  const chatNodes = []
+  const bridge = await loadBridge({
+    sessions: [sessionRow('session-target', { retainedBy: { mainView: 1 } })],
+    retained: ['session-target'],
+    chatNodes,
+    anchorKey: 'node-9',
+    loadThrough: async () => {
+      if (!chatNodes.some(node => node.anchorSeq === 9)) chatNodes.push({ anchorSeq: 9, key: 'node-9' })
+    },
+  })
+  bridge.message({ type: 'synapse:map-ready' })
+
+  bridge.message({ type: 'synapse:open-session', sessionId: 'session-target', seq: 9 })
+
+  assert.equal(bridge.anchorScrolled(), true)
+})
+
+test('does not throw when the opened session has no chat target yet', async () => {
+  const bridge = await loadBridge({ sessions: [sessionRow('session-target')], retained: [] })
+  bridge.message({ type: 'synapse:map-ready' })
+
+  assert.doesNotThrow(() => bridge.message({ type: 'synapse:open-session', sessionId: 'session-target', seq: 7 }))
 })
 
 test('scrolls the opened conversation to the requested turn anchor', async () => {
@@ -639,6 +676,7 @@ test('declares the client package of every service the bridge injects', async ()
     workspaces: '@deepseek-ai/dsh-api-workspace-controller',
     uiWorkspace: '@deepseek-ai/dsh-client-ui-workspace',
     uiConversation: '@deepseek-ai/dsh-client-ui-conversation',
+    layout: '@deepseek-ai/dsh-client-ui-layout',
   }
   const bridge = await loadBridge()
 

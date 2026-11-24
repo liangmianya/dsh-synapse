@@ -75,7 +75,7 @@ window.__ModuleLoader__.load({
       try { storage.removeItem(SWITCH_POSITION_KEY) } catch { /* private mode */ }
     }
 
-    module.exports.inject = ['sessions', 'workspaces', 'uiWorkspace', 'uiConversation']
+    module.exports.inject = ['sessions', 'workspaces', 'uiWorkspace', 'uiConversation', 'layout']
     module.exports.apply = ctx => {
       const prompt = async (sessionId, text) => {
         // 0.1.7 owns Session lifetime explicitly: `scope()` only borrows an
@@ -113,7 +113,7 @@ window.__ModuleLoader__.load({
       //     rightward (title, lineage and agent-preset chips). Half the sidebar
       //     width puts the pill over the centre of the content area instead of
       //     the window; `min()` pulls it back in on narrow windows.
-      style.textContent = '.dsh-synapse-switch{position:fixed;z-index:200;top:calc(var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) + 12px);left:min(calc(50% + 130px),calc(100% - 96px));display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d1d5db;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px);-webkit-app-region:no-drag;box-shadow:0 2px 8px rgba(17,24,39,.1)}.dsh-synapse-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#6b7280;font:600 12px Inter,system-ui,sans-serif;cursor:pointer;white-space:nowrap;-webkit-app-region:no-drag}.dsh-synapse-switch button:hover{background:#f3f4f6;color:#111827}.dsh-synapse-switch button.active{background:#111827;color:#fff}.dsh-synapse-switch button:focus-visible{outline:2px solid #111827;outline-offset:2px}.dsh-synapse-overlay{position:fixed;z-index:100;inset:var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) 0 0 0;background:#f5f7fa}.dsh-synapse-overlay.is-opening{visibility:hidden}.dsh-synapse-overlay[hidden]{display:none}.dsh-synapse-overlay iframe{display:block;width:100%;height:100%;border:0}html[data-fullscreen] .dsh-synapse-overlay{top:0}html[data-fullscreen] .dsh-synapse-switch{top:12px}.dsh-synapse-grip{display:grid;width:16px;height:28px;place-items:center;border-radius:999px;color:#9ca3af;background:transparent;cursor:grab;touch-action:none;-webkit-app-region:no-drag}.dsh-synapse-grip:hover{background:#f3f4f6;color:#4b5563}.dsh-synapse-grip:focus-visible{outline:2px solid #111827;outline-offset:2px}.dsh-synapse-grip svg{width:8px;height:14px;fill:currentColor}.dsh-synapse-switch.is-dragging .dsh-synapse-grip{cursor:grabbing}'
+      style.textContent = '.dsh-synapse-switch{position:fixed;z-index:200;top:calc(var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) + 12px);left:min(calc(50% + 130px),calc(100% - 96px));display:flex;gap:2px;transform:translateX(-50%);border:1px solid #d1d5db;border-radius:999px;background:rgba(255,255,255,.96);padding:3px;backdrop-filter:blur(10px);-webkit-app-region:no-drag;box-shadow:0 2px 8px rgba(17,24,39,.1)}.dsh-synapse-switch button{height:28px;border:0;border-radius:999px;background:transparent;padding:0 11px;color:#6b7280;font:600 12px Inter,system-ui,sans-serif;cursor:pointer;white-space:nowrap;-webkit-app-region:no-drag}.dsh-synapse-switch button:hover{background:#f3f4f6;color:#111827}.dsh-synapse-switch button.active{background:#111827;color:#fff}.dsh-synapse-switch button:focus-visible{outline:2px solid #111827;outline-offset:2px}.dsh-synapse-overlay{position:fixed;z-index:100;inset:var(--dsh-frame-chrome-top,var(--dsh-frame-top-clearance,0px)) 0 0 0;background:#f5f7fa}.dsh-synapse-overlay.is-opening{visibility:hidden}.dsh-synapse-overlay[hidden]{display:none}.dsh-synapse-overlay iframe{display:block;width:100%;height:100%;border:0}html[data-fullscreen] .dsh-synapse-overlay{top:0}html[data-fullscreen] .dsh-synapse-switch{top:12px}.dsh-synapse-grip{display:grid;width:16px;height:28px;place-items:center;border-radius:999px;color:#9ca3af;background:transparent;cursor:grab;touch-action:none;-webkit-app-region:no-drag}.dsh-synapse-grip:hover{background:#f3f4f6;color:#4b5563}.dsh-synapse-grip:focus-visible{outline:2px solid #111827;outline-offset:2px}.dsh-synapse-grip svg{width:8px;height:14px;fill:currentColor}.dsh-synapse-switch.is-dragging .dsh-synapse-grip{cursor:grabbing}.dsh-synapse-drag-hole{position:fixed;left:0;right:0;z-index:0;pointer-events:none;-webkit-app-region:no-drag}'
       document.head.append(style)
       const host = document.createElement('div')
       host.className = 'dsh-synapse-host'
@@ -221,7 +221,157 @@ window.__ModuleLoader__.load({
         dialogButton.setAttribute('aria-pressed', String(!showingMap))
         mapButton.classList.toggle('active', showingMap)
         mapButton.setAttribute('aria-pressed', String(showingMap))
+        if (showingMap) ensureDragHole()
+        else removeDragHole()
+        window.requestAnimationFrame(() => { if (showingMap) syncHostSidebar(true) })
       }
+
+      // --- host chrome contract --------------------------------------------
+      // Keep the host's window-drag rectangles untouched. The host can both
+      // drag and click its own header because its tabs are no-drag children of
+      // the drag header. An iframe cannot punch that hole itself, so add one
+      // transparent no-drag child to the host header covering exactly the
+      // part of the header that the overlay covers. 0..48px of the header
+      // remains draggable; only the overlay's own 48..76px band is cut out.
+      let dragHole = null
+      let dragHoleHeader = null
+      let dragHoleObserver = null
+      const mainHostHeader = () => {
+        // There are several [data-window-drag] elements (conversation header,
+        // sidebar logo row, right tab strip). The right tab strip can sit at
+        // x=windowWidth with a wider right edge, so pick by width among the
+        // ones whose left edge is inside the window. That is the conversation
+        // header the overlay actually overlaps.
+        const headers = [...document.querySelectorAll('[data-window-drag]')]
+          .map(element => ({ element, rect: element.getBoundingClientRect() }))
+          .filter(item => item.rect.width > 0 && item.rect.top <= 1
+            && item.rect.left < window.innerWidth - 1
+            && item.rect.width > window.innerWidth * .4)
+          .sort((a, b) => b.rect.width - a.rect.width)
+        return headers[0]?.element ?? null
+      }
+      const overlayTop = () => {
+        if (document.documentElement.hasAttribute('data-fullscreen')) return 0
+        const styles = getComputedStyle(document.documentElement)
+        const chrome = Number.parseFloat(styles.getPropertyValue('--dsh-frame-chrome-top'))
+        if (Number.isFinite(chrome)) return chrome
+        const clearance = Number.parseFloat(styles.getPropertyValue('--dsh-frame-top-clearance'))
+        return Number.isFinite(clearance) ? clearance : 0
+      }
+      const positionDragHole = () => {
+        if (dragHole === null || dragHoleHeader === null) return
+        if (!dragHoleHeader.isConnected) { ensureDragHole(); return }
+        // Use the same top inset as the overlay instead of reading a hidden
+        // overlay's zero rect while the map is opening.
+        const top = overlayTop()
+        const bottom = dragHoleHeader.getBoundingClientRect().bottom
+        const height = Math.max(0, bottom - top)
+        if (height === 0) { dragHole.style.display = 'none'; return }
+        dragHole.style.display = 'block'
+        dragHole.style.top = `${Math.ceil(top)}px`
+        dragHole.style.height = `${Math.ceil(height)}px`
+      }
+      const removeDragHole = () => {
+        dragHoleObserver?.disconnect()
+        dragHoleObserver = null
+        dragHole?.remove()
+        dragHole = null
+        dragHoleHeader = null
+      }
+      const ensureDragHole = () => {
+        // Windowed: after moving the canvas toolbar below the host header there
+        // are no plugin controls inside 48–76px, so leave the host's drag
+        // rectangles completely alone. Fullscreen: the overlay covers the host
+        // top strip and the tabs/sidebar proxy still need a click hole.
+        if (document.documentElement.dataset.platform !== 'darwin'
+          || !document.documentElement.hasAttribute('data-fullscreen')) { removeDragHole(); return }
+        const header = mainHostHeader()
+        if (header === null) { removeDragHole(); return }
+        if (dragHole === null) {
+          dragHole = document.createElement('div')
+          dragHole.className = 'dsh-synapse-drag-hole'
+          dragHole.setAttribute('aria-hidden', 'true')
+        }
+        if (dragHoleHeader !== header) {
+          dragHole.remove()
+          dragHoleHeader = header
+          header.append(dragHole)
+          dragHoleObserver?.disconnect()
+          dragHoleObserver = new MutationObserver(() => {
+            // React may reconcile the header; keep the hole present.
+            if (dragHole !== null && !dragHole.isConnected && dragHoleHeader === header) {
+              header.append(dragHole)
+              positionDragHole()
+            }
+          })
+          dragHoleObserver.observe(header, { childList: true })
+        }
+        positionDragHole()
+      }
+
+      // --- host sidebar state ---------------------------------------------
+      // The host toggle is the only sidebar control; mirror its state into the
+      // iframe so the plugin sidebar follows it.
+      const findHostSidebarToggle = () => [...document.querySelectorAll('button[aria-label]')]
+        .filter(button => {
+          const label = button.getAttribute('aria-label') ?? ''
+          return /侧边栏|sidebar/i.test(label) && !/右|right/i.test(label)
+        })[0]
+      const readHostSidebarCollapsed = () => {
+        const toggle = findHostSidebarToggle()
+        const label = toggle?.getAttribute('aria-label') ?? ''
+        if (/展开|expand/i.test(label)) return true
+        if (/收起|collapse/i.test(label)) return false
+        return document.querySelector('[data-sidebar-collapsed]') !== null
+      }
+      let lastHostSidebarCollapsed = null
+      const syncHostSidebar = (force = false) => {
+        const collapsed = readHostSidebarCollapsed()
+        if (!force && collapsed === lastHostSidebarCollapsed) return
+        lastHostSidebarCollapsed = collapsed
+        send('synapse:host-sidebar', { collapsed })
+      }
+      const hostSidebarObserver = new MutationObserver(() => {
+        syncHostSidebar()
+        syncHostChrome()
+        ensureDragHole()
+      })
+      hostSidebarObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['aria-label', 'data-sidebar-collapsed'],
+        subtree: true,
+      })
+      const computeHostToggleVisible = () => {
+        // Fullscreen hides/covers the host top strip; always offer the proxy.
+        if (document.documentElement.hasAttribute('data-fullscreen')) return false
+        if (overlay.hidden) return true
+        const toggle = findHostSidebarToggle()
+        if (toggle === undefined) return false
+        const rect = toggle.getBoundingClientRect()
+        if (rect.width === 0 || rect.height === 0) return false
+        // Windowed: the host toggle sits above the overlay (bottom < overlay
+        // top). Web: the overlay starts at 0 and covers it, so the plugin shows
+        // its proxy button.
+        return rect.bottom <= overlayTop() + 1
+      }
+      const syncHostChrome = () => {
+        send('synapse:host-chrome', { hostToggleVisible: computeHostToggleVisible() })
+      }
+      const fullscreenObserver = new MutationObserver(() => {
+        syncHostChrome()
+        ensureDragHole()
+        positionDragHole()
+      })
+      fullscreenObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-fullscreen'],
+      })
+      const onWindowResize = () => {
+        ensureDragHole()
+        positionDragHole()
+        syncHostChrome()
+      }
+      window.addEventListener('resize', onWindowResize)
       const close = () => {
         window.clearTimeout(mapOpenFallback)
         mapOpening = false
@@ -352,6 +502,7 @@ window.__ModuleLoader__.load({
         overlay.hidden = false
         overlay.classList.remove('is-opening')
         syncCurrentSession()
+        syncHostChrome()
       }
       const open = () => {
         window.clearTimeout(mapOpenFallback)
@@ -361,6 +512,7 @@ window.__ModuleLoader__.load({
         // real scroll offset. display:none would clamp scrollTop back to zero.
         overlay.hidden = false
         overlay.classList.add('is-opening')
+        syncHostChrome()
         window.requestAnimationFrame(() => {
           send('synapse:map-opened')
           syncCurrentSession()
@@ -369,12 +521,28 @@ window.__ModuleLoader__.load({
       }
       const onFrameLoad = () => {
         syncCurrentSession()
+        syncHostSidebar(true)
+        syncHostChrome()
+        ensureDragHole()
         if (mapOpening) send('synapse:map-opened')
       }
       const onMessage = event => {
         if (event.origin !== location.origin || event.data?.source !== 'dsh-synapse') return
         if (event.data.type === 'synapse:close') return close()
-        if (event.data.type === 'synapse:map-ready') return showMapOverlay()
+        if (event.data.type === 'synapse:map-ready') {
+          showMapOverlay()
+          syncHostSidebar(true)
+          syncHostChrome()
+          ensureDragHole()
+          return
+        }
+        if (event.data.type === 'synapse:toggle-host-sidebar') {
+          try {
+            if (typeof ctx.layout?.toggleSidebar === 'function') ctx.layout.toggleSidebar()
+            else findHostSidebarToggle()?.click()
+          } catch { /* host DOM/API fallback already attempted */ }
+          return
+        }
         if (event.data.type === 'synapse:request-current') {
           send(overlay.hidden ? 'synapse:map-closed' : 'synapse:map-visible')
           publishLiveSessions()
@@ -390,14 +558,23 @@ window.__ModuleLoader__.load({
           // so resolve seq -> node key -> scroll once the view materializes.
           const seq = event.data.seq
           if (Number.isInteger(seq)) {
+            // Set once, on the first attempt where the chat target exists. A
+            // 300 ms first attempt can run before the conversation view attaches.
+            let loadRequested = false
             const tryScroll = attempt => {
-              const record = liveSessions.get(event.data.sessionId)
-              if (record === undefined) {
-                if (attempt < 3) window.setTimeout(() => tryScroll(attempt + 1), 500)
+              // The chat target appears only once the conversation view attaches.
+              // A non-running Session can still have an empty record at this
+              // point; refresh it instead of dereferencing record.chat blindly.
+              let record = liveSessions.get(event.data.sessionId)
+              if (record === undefined || record.chat === undefined) syncLiveSessions()
+              record = liveSessions.get(event.data.sessionId)
+              if (record === undefined || record.chat === undefined) {
+                if (attempt < 5) window.setTimeout(() => tryScroll(attempt + 1), 500)
                 return
               }
+              const chat = record.chat
               let key = undefined
-              for (const node of record.chat.getSnapshot()?.nodes.values() ?? []) {
+              for (const node of chat.getSnapshot()?.nodes.values() ?? []) {
                 if (node.anchorSeq === seq) { key = node.key; break }
               }
               if (key !== undefined) {
@@ -406,12 +583,15 @@ window.__ModuleLoader__.load({
                 return
               }
               // The requested turn may sit outside the loaded window; the jump
-              // loader pages history back through the seq, then the retry reads
-              // the rebuilt node set.
-              if (attempt === 0 && typeof record.session.loadThrough === 'function') {
-                void record.session.loadThrough(seq).catch(() => {})
+              // loader lives on the Session binding, not on the live record.
+              // paging history back through the seq, then the retry reads the
+              // rebuilt node set.
+              const loadThrough = record.binding?.session?.loadThrough
+              if (!loadRequested && typeof loadThrough === 'function') {
+                loadRequested = true
+                try { void loadThrough.call(record.binding.session, seq).catch(() => {}) } catch { /* keep retrying the anchor */ }
               }
-              if (attempt < 3) window.setTimeout(() => tryScroll(attempt + 1), 500)
+              if (attempt < 5) window.setTimeout(() => tryScroll(attempt + 1), 500)
             }
             window.setTimeout(() => tryScroll(0), 300)
           }
@@ -511,6 +691,10 @@ window.__ModuleLoader__.load({
         for (const reference of ownReferences.values()) reference.release()
         ownReferences.clear()
         window.clearTimeout(convergeSwitchLater)
+        hostSidebarObserver.disconnect()
+        fullscreenObserver.disconnect()
+        removeDragHole()
+        window.removeEventListener('resize', onWindowResize)
         host.remove()
         style.remove()
       }, 'synapse: web workspace switch')

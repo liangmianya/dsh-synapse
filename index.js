@@ -38,6 +38,7 @@ const LOCK_STALE_MS = 60_000
 // burst of session events costs a single full-state write instead of one per
 // event (issue #13: per-event saves pinned the main thread at ~90% CPU).
 const SAVE_DEBOUNCE_MS = 800
+const SAVE_RETRY_MS = 2_000
 
 /** JSON persistence for the Synapse workspace graph. */
 export class WorkspaceStore {
@@ -50,8 +51,10 @@ export class WorkspaceStore {
     this.lastKnownMtime = null
     this.externalModWarned = false
     this.lockWarned = false
+    this.lockOwner = null
     this.dirty = false
     this.flushTimer = null
+    this.retryTimer = null
   }
 
   async list() {
@@ -452,8 +455,21 @@ export class WorkspaceStore {
     if (!this.dirty) return Promise.resolve()
     this.dirty = false
     const task = this.serial.then(() => this.save())
-    this.serial = task.catch(() => undefined)
+    this.serial = task.catch(() => {
+      this.dirty = true
+      this.scheduleRetry()
+    })
     return task
+  }
+
+  /** Retry a save that lost the cross-process lock, without keeping Node alive. */
+  scheduleRetry() {
+    if (this.retryTimer !== null) return
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null
+      void this.flush().catch(() => {})
+    }, SAVE_RETRY_MS)
+    this.retryTimer.unref?.()
   }
 
   async save() {
@@ -469,7 +485,13 @@ export class WorkspaceStore {
         process.stderr.write('synapse: workspaces.json 已被另一个 dsh web 实例修改，本实例的写入可能覆盖其更改——请只运行一个实例\n')
       }
     }
-    await this.acquireLock()
+    if (!(await this.acquireLock())) {
+      this.dirty = true
+      this.scheduleRetry()
+      const error = new Error('synapse: 另一个 dsh web 实例正在写入 workspaces.json，本次修改暂未保存')
+      error.code = 'SYNAPSE_STORE_LOCKED'
+      throw error
+    }
     try {
       const temporaryFile = `${this.dataFile}.${process.pid}.tmp`
       await writeFile(temporaryFile, `${JSON.stringify(this.state)}\n`, 'utf8')
@@ -487,20 +509,28 @@ export class WorkspaceStore {
   /** Take an exclusive cross-process lock, breaking a stale one; warn when a live process holds it. */
   async acquireLock() {
     const lockFile = `${this.dataFile}.lock`
-    if (await this.tryAcquire(lockFile)) return
+    const owner = `${process.pid}:${randomUUID()}`
+    if (await this.tryAcquire(lockFile, owner)) {
+      this.lockOwner = owner
+      return true
+    }
     if (await this.lockIsStale(lockFile)) {
       await unlink(lockFile).catch(() => {})
-      if (await this.tryAcquire(lockFile)) return
+      if (await this.tryAcquire(lockFile, owner)) {
+        this.lockOwner = owner
+        return true
+      }
     }
     if (!this.lockWarned) {
       this.lockWarned = true
-      process.stderr.write('synapse: 另一个 dsh web 实例正在写入 workspaces.json——请只运行一个实例，否则画布数据可能互相覆盖\n')
+      process.stderr.write('synapse: 另一个 dsh web 实例正在写入 workspaces.json——本次保存已推迟，请只运行一个实例\n')
     }
+    return false
   }
 
-  async tryAcquire(lockFile) {
+  async tryAcquire(lockFile, owner) {
     try {
-      await writeFile(lockFile, `${process.pid}\n`, { flag: 'wx' })
+      await writeFile(lockFile, `${owner}\n`, { flag: 'wx' })
       return true
     } catch {
       return false
@@ -527,7 +557,17 @@ export class WorkspaceStore {
   }
 
   async releaseLock() {
-    await unlink(`${this.dataFile}.lock`).catch(() => {})
+    const owner = this.lockOwner
+    this.lockOwner = null
+    if (owner === null) return
+    const lockFile = `${this.dataFile}.lock`
+    try {
+      const content = await readFile(lockFile, 'utf8')
+      if (content.trim() !== owner) return
+      await unlink(lockFile)
+    } catch {
+      // Lock already gone or replaced; never delete another writer's lock.
+    }
   }
 
   workspace(workspaceId) {

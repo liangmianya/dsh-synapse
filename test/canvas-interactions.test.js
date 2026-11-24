@@ -130,22 +130,40 @@ test('only primary left title drags move cards, and subthreshold clicks never sa
   assert.equal(h.state.dragging, false)
 })
 
-test('Escape and lost focus restore an unfinished card drag and clean up pending frames', () => {
-  for (const cancel of [h => h.key('Escape'), h => h.window.dispatch('blur')]) {
-    const h = harness()
-    h.down()
-    h.move({ clientX: 60, clientY: 40 })
-    h.step()
-    h.move({ clientX: 70 })
-    cancel(h)
-    assert.deepEqual(plain(h.dataCard.position), { x: 100, y: 200 })
-    assert.equal(h.frames.size, 0)
-    assert.equal(h.card.hasPointerCapture(1), false)
-    assert.deepEqual(h.saves, [])
-    assert.equal(h.document.listeners.get('pointermove').size, 0)
-    h.move({ clientX: 100 })
-    assert.equal(h.frames.size, 0)
-  }
+test('Escape restores an unfinished card drag and cleans up pending frames', () => {
+  const h = harness()
+  h.down()
+  h.move({ clientX: 60, clientY: 40 })
+  h.step()
+  h.move({ clientX: 70 })
+  h.key('Escape')
+  assert.deepEqual(plain(h.dataCard.position), { x: 100, y: 200 })
+  assert.equal(h.frames.size, 0)
+  assert.equal(h.card.hasPointerCapture(1), false)
+  assert.deepEqual(h.saves, [])
+  assert.equal(h.document.listeners.get('pointermove').size, 0)
+  h.move({ clientX: 100 })
+  assert.equal(h.frames.size, 0)
+})
+
+test('window blur commits an unfinished card drag instead of snapping it back', () => {
+  // A release that moves focus out of the iframe arrives after the user has
+  // already positioned the card; the gesture commits at that position (the
+  // bug was restoring the drag origin on this path).
+  const h = harness()
+  h.down()
+  h.move({ clientX: 60, clientY: 40 })
+  h.step()
+  h.move({ clientX: 70 })
+  h.window.dispatch('blur')
+  assert.deepEqual(plain(h.dataCard.position), { x: 220, y: 200 })
+  assert.equal(h.frames.size, 0)
+  assert.equal(h.card.hasPointerCapture(1), false)
+  assert.equal(h.saves.length, 1)
+  assert.deepEqual(h.saves[0].position, { x: 220, y: 200 })
+  assert.equal(h.document.listeners.get('pointermove').size, 0)
+  h.move({ clientX: 100 })
+  assert.equal(h.frames.size, 0)
 })
 
 test('Space and middle button pan in screen pixels, then release temporary mode on blur', () => {

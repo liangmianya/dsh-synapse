@@ -22,7 +22,9 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 .sidebar-toggle svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.4; }
 .top-actions { gap: 10px; }
 .canvas-controls { display: flex; flex: none; align-items: center; gap: 2px; }
-.canvas-top-controls { position: relative; z-index: 80; gap: 8px; margin-left: auto; }
+.canvas-top-controls { position: absolute; top: 12px; right: 16px; z-index: 80; gap: 8px; }
+/* The inspector owns the right edge; float the top controls just left of it. */
+.canvas-view:has(> .card-inspector) > .canvas-top-controls { right: calc(var(--card-inspector-width) + 16px); }
 .canvas-control-group { display: flex; flex: none; align-items: center; gap: 2px; padding: 2px; border: 1px solid var(--select-border); border-radius: 9px; background: var(--select-surface); }
 .canvas-bottom-controls { position: absolute; z-index: 32; right: 16px; bottom: 16px; left: 16px; display: flex; align-items: center; justify-content: space-between; gap: 8px; pointer-events: none; }
 .canvas-bottom-controls > .canvas-controls { pointer-events: auto; box-shadow: 0 2px 8px rgba(15,23,42,.06); }
