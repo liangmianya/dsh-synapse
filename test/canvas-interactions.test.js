@@ -3,7 +3,9 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import vm from 'node:vm'
 
-const source = await readFile(new URL('../app.js', import.meta.url), 'utf8')
+// A Windows checkout may hand back CRLF; the boundaries below are written with
+// LF, so normalize once instead of making every marker checkout-dependent.
+const source = (await readFile(new URL('../app.js', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
 const snippet = (from, to) => {
   const start = source.indexOf(from)
   const end = source.indexOf(to, start + from.length)

@@ -1102,8 +1102,37 @@ function sendFile(res, contentType, body) {
   res.end(body)
 }
 
+// The bundled KaTeX build is published as three kinds of file. Serving it
+// through an explicit whitelist keeps the rest of vendor/katex (LICENSE,
+// VERSION) and anything outside that directory unreachable.
+const KATEX_FILES = new Map([
+  ['/synapse/vendor/katex/katex.min.js', ['katex.min.js', 'text/javascript; charset=utf-8']],
+  ['/synapse/vendor/katex/katex.min.css', ['katex.min.css', 'text/css; charset=utf-8']],
+])
+const KATEX_FONT = /^\/synapse\/vendor\/katex\/fonts\/(KaTeX_[A-Za-z0-9_-]+\.woff2)$/
+
+async function sendKatex(req, res) {
+  const pathname = new URL(req.url ?? '/', 'http://dsh.local').pathname
+  const font = KATEX_FONT.exec(pathname)
+  const entry = KATEX_FILES.get(pathname) ?? (font === null ? null : [`fonts/${font[1]}`, 'font/woff2'])
+  if (entry === null) {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+    return res.end('Not found')
+  }
+  try {
+    const body = await readFile(new URL(`./vendor/katex/${entry[0]}`, import.meta.url))
+    // One hour, not a year: an upgraded plugin reuses these URLs, and a stale
+    // script paired with newer fonts would render formulas badly.
+    res.writeHead(200, { 'content-type': entry[1], 'cache-control': 'public, max-age=3600' })
+    res.end(body)
+  } catch {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('Not found')
+  }
+}
+
 function page() {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><base href="./"><title>Synapse for DSH</title><link rel="stylesheet" href="styles.css"></head><body><div id="app"></div><script src="browser-cache.js"></script><script src="app.js"></script></body></html>`
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><base href="./"><title>Synapse for DSH</title><link rel="stylesheet" href="vendor/katex/katex.min.css"><link rel="stylesheet" href="styles.css"></head><body><div id="app"></div><script src="browser-cache.js"></script><script src="vendor/katex/katex.min.js"></script><script src="math.js"></script><script src="app.js"></script></body></html>`
 }
 
 /** Mount Synapse routes on the existing DSH Web Server. */
@@ -1260,5 +1289,7 @@ export function apply(ctx, config) {
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/browser-cache.js', handler: async (_req, res) => { sendFile(res, 'text/javascript; charset=utf-8', await readFile(new URL('./browser-cache.js', import.meta.url), 'utf8')) } }), 'synapse: browser cache')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/styles.css', handler: async (_req, res) => { sendFile(res, 'text/css; charset=utf-8', await readFile(new URL('./styles.css', import.meta.url), 'utf8')) } }), 'synapse: styles')
   ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/deepseek-mark.svg', handler: async (_req, res) => { sendFile(res, 'image/svg+xml', await readFile(new URL('./deepseek-mark.svg', import.meta.url), 'utf8')) } }), 'synapse: DeepSeek mark')
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: '/synapse/math.js', handler: async (_req, res) => { sendFile(res, 'text/javascript; charset=utf-8', await readFile(new URL('./math.js', import.meta.url), 'utf8')) } }), 'synapse: math')
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/synapse/vendor/katex', handler: sendKatex }), 'synapse: katex assets')
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/synapse/api', handler: api }), 'synapse: api')
 }

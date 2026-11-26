@@ -767,12 +767,28 @@ function latestMessage(thread, kind) { return hydratedMessage(thread, [...messag
 function questionFor(thread) { return latestMessage(thread, 'user')?.text ?? thread.dshSessionTitle ?? '等待用户提问' }
 function answerFor(thread) { return latestMessage(thread, 'assistant') ?? null }
 
+// Math is typeset before the emphasis pass so TeX operators such as `*` and
+// `_` never reach the Markdown rules. When math.js is missing the expression is
+// kept as written instead of silently disappearing.
+function mathRenderer() { return globalThis.SynapseMath ?? null }
+function mathHtml(tex, display) {
+  const renderer = mathRenderer()
+  return renderer === null ? `<code class="math-source">${escapeHtml(tex)}</code>` : renderer.render(tex, display)
+}
+function inlineSegments(text) {
+  const renderer = mathRenderer()
+  return renderer === null ? [{ kind: 'text', value: String(text) }] : renderer.scanInline(text)
+}
+
 function inlineMarkdown(text) {
-  return escapeHtml(text)
+  const markup = value => escapeHtml(value)
     .replace(/`([^`\n]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/~~([^~]+)~~/g, '<s>$1</s>')
     .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+  return inlineSegments(text)
+    .map(segment => segment.kind === 'math' ? mathHtml(segment.value, segment.display) : markup(segment.value))
+    .join('')
 }
 
 const tableCells = line => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim())
@@ -782,12 +798,79 @@ const isTableDelimiter = line => {
   return cells.length > 0 && cells.every(cell => /^:?-+:?$/.test(cell))
 }
 
+/**
+ * A display formula that owns its paragraph: `$$...$$` or `\[...\]`, on one
+ * line or spread over several. A formula sharing a line with prose stays
+ * inline, where the scanner can still find it.
+ */
+function displayBlock(lines, start) {
+  const line = lines[start].trim()
+  const closer = line.startsWith('$$') ? '$$' : line.startsWith('\\[') ? '\\]' : null
+  if (closer === null) return null
+  const rest = line.slice(2).trim()
+  // A block starts only with a bare opener or a formula that closes on this
+  // same line. Text sharing the opener line stays inline, where the scanner
+  // still finds the formula and leaves the prose alone.
+  if (rest !== '' && !rest.endsWith(closer)) return null
+  if (rest.length > closer.length) {
+    return { value: rest.slice(0, rest.length - closer.length).trim(), next: start + 1 }
+  }
+  const body = []
+  for (let index = start + 1; index < lines.length; index++) {
+    const current = lines[index].trim()
+    if (current.endsWith(closer)) {
+      const head = current.slice(0, current.length - closer.length).trim()
+      if (head !== '') body.push(head)
+      const value = body.join('\n').trim()
+      return value === '' ? null : { value, next: index + 1 }
+    }
+    body.push(lines[index])
+  }
+  return null
+}
+
+/**
+ * Split fenced code out of the Markdown stream, keeping the info string so a
+ * ```math fence can be typeset. Only a line-leading run of backticks opens a
+ * fence; a bare split on ``` also fired inside ordinary prose.
+ */
+function markdownSegments(text) {
+  const lines = String(text).split('\n')
+  const segments = []
+  let markdown = []
+  const flush = () => {
+    if (markdown.length === 0) return
+    segments.push({ code: false, text: markdown.join('\n') })
+    markdown = []
+  }
+  for (let index = 0; index < lines.length; index++) {
+    const fence = /^\s*(`{3,})\s*([^`]*)$/.exec(lines[index])
+    if (fence === null) { markdown.push(lines[index]); continue }
+    flush()
+    const marker = fence[1]
+    const info = fence[2].trim()
+    const body = []
+    index++
+    const closing = new RegExp(`^\\s*\`{${marker.length},}\\s*$`)
+    while (index < lines.length && !closing.test(lines[index])) { body.push(lines[index]); index++ }
+    segments.push({ code: true, lang: info.split(/\s+/)[0] ?? '', text: body.join('\n') })
+  }
+  flush()
+  return segments
+}
+
 function markdownBlock(text) {
   const lines = text.split('\n')
   const output = []
   for (let index = 0; index < lines.length;) {
     const line = lines[index]
     if (line.trim() === '') { index++; continue }
+    const display = displayBlock(lines, index)
+    if (display !== null) {
+      output.push(`<div class="math-display">${mathHtml(display.value, true)}</div>`)
+      index = display.next
+      continue
+    }
     const heading = /^(#{1,3})\s+(.+)$/.exec(line)
     if (heading !== null) {
       const level = heading[1].length
@@ -823,7 +906,7 @@ function markdownBlock(text) {
       continue
     }
     const paragraph = []
-    while (index < lines.length && lines[index].trim() !== '' && !/^(#{1,3})\s+/.test(lines[index]) && !/^[-*+]\s+/.test(lines[index]) && !/^\d+[.)]\s+/.test(lines[index])) paragraph.push(lines[index++])
+    while (index < lines.length && lines[index].trim() !== '' && !/^(#{1,3})\s+/.test(lines[index]) && !/^[-*+]\s+/.test(lines[index]) && !/^\d+[.)]\s+/.test(lines[index]) && displayBlock(lines, index) === null) paragraph.push(lines[index++])
     // A marker-only line such as PowerShell's "+ " diagnostic is neither a
     // list item nor paragraph content under the rules above. Consume it so
     // the parser always makes progress.
@@ -842,10 +925,11 @@ function renderMarkdown(text, cache = true) {
   const key = String(text)
   const cached = cache ? markdownCache.get(key) : undefined
   if (cached !== undefined) return cached
-  const parts = key.split(/```/)
-  const rendered = parts.map((part, index) => index % 2 === 1
-    ? `<pre><code>${escapeHtml(part.replace(/^\w*\n/, ''))}</code></pre>`
-    : markdownBlock(part)).join('')
+  const rendered = markdownSegments(key).map(segment => segment.code
+    ? segment.lang === 'math'
+      ? `<div class="math-display">${mathHtml(segment.text.trim(), true)}</div>`
+      : `<pre><code>${escapeHtml(segment.text)}</code></pre>`
+    : markdownBlock(segment.text)).join('')
   const bytes = SynapseCache.textBytes(key) + SynapseCache.textBytes(rendered) + 128
   if (cache && bytes <= SynapseCache.LIMITS.markdownEntryBytes) markdownCache.set(key, rendered, SynapseCache.textBytes(rendered))
   return rendered

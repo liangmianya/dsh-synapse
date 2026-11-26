@@ -206,6 +206,12 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 .thread-answer-empty { color: #94a3b8; }
 .thread-answer-pending, .message-pending p { color: #374151; font-style: italic; }
 .thread-answer-error { display: -webkit-box; margin: 8px 0 0; overflow: hidden; color: #b42318; font-weight: 620; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+/* Math: KaTeX draws with currentColor, so formulas follow each theme; a display
+   formula scrolls sideways instead of widening the card or reading panel. */
+.math-display { max-width: 100%; margin: 8px 0; overflow-x: auto; overflow-y: hidden; }
+.math-display > .katex-display { margin: 0; }
+.thread-answer .katex, .card-inspector-answer .katex, .message-body .katex { font-size: 1.06em; }
+.katex-error { color: #b42318; }
 .thread-card footer { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; padding: 7px; border-top: 1px solid #edf0f3; }
 .thread-card footer button { min-height: 26px; padding: 0 7px; border: 0; display: inline-flex; align-items: center; gap: 4px; color: #526174; font-size: 11px; }
 .thread-card footer button svg { width: 13px; height: 13px; flex: none; }

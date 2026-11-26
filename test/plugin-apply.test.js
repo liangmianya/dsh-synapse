@@ -43,7 +43,7 @@ function hostContext(options = {}) {
     logger: { warn: () => {}, error: () => {} },
     webServer: {
       register: route => {
-        routes.push({ kind: route.kind, path: route.path })
+        routes.push({ kind: route.kind, path: route.path, handler: route.handler })
         return () => {}
       },
     },
@@ -86,15 +86,65 @@ test('mounts its own routes on the existing DSH Web Server', async () => {
 
   apply(host.ctx, { dataFile: join(directory, 'state.json') })
 
-  assert.deepEqual(host.routes, [
+  assert.deepEqual(host.routes.map(({ kind, path }) => ({ kind, path })), [
     { kind: 'exact', path: '/synapse' },
     { kind: 'exact', path: '/synapse/' },
     { kind: 'exact', path: '/synapse/app.js' },
     { kind: 'exact', path: '/synapse/browser-cache.js' },
     { kind: 'exact', path: '/synapse/styles.css' },
     { kind: 'exact', path: '/synapse/deepseek-mark.svg' },
+    { kind: 'exact', path: '/synapse/math.js' },
+    { kind: 'prefix', path: '/synapse/vendor/katex' },
     { kind: 'prefix', path: '/synapse/api' },
   ])
+})
+
+/** Drive one registered route handler the way the Web Server would. */
+async function requestRoute(route, path) {
+  const response = { status: 0, headers: {}, body: undefined }
+  const res = {
+    writeHead(status, headers = {}) { response.status = status; response.headers = headers },
+    end(body) { response.body = Buffer.isBuffer(body) ? body : Buffer.from(String(body ?? '')) },
+  }
+  await route.handler({ url: path, method: 'GET', headers: {} }, res)
+  return response
+}
+
+test('serves bundled KaTeX through a whitelisted vendor route', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-apply-math-'))
+  const host = hostContext()
+  apply(host.ctx, { dataFile: join(directory, 'state.json') })
+
+  const math = host.routes.find(route => route.path === '/synapse/math.js')
+  const vendor = host.routes.find(route => route.path === '/synapse/vendor/katex')
+  assert.ok(math && vendor, 'math and vendor routes must be registered')
+
+  const script = await requestRoute(math, '/synapse/math.js')
+  assert.equal(script.status, 200)
+  assert.match(script.headers['content-type'], /text\/javascript/)
+  assert.match(script.body.toString(), /SynapseMath/)
+
+  const engine = await requestRoute(vendor, '/synapse/vendor/katex/katex.min.js')
+  assert.equal(engine.status, 200)
+  assert.match(engine.headers['content-type'], /text\/javascript/)
+  assert.match(engine.body.toString(), /katex/)
+
+  const stylesheet = await requestRoute(vendor, '/synapse/vendor/katex/katex.min.css')
+  assert.equal(stylesheet.status, 200)
+  assert.match(stylesheet.headers['content-type'], /text\/css/)
+
+  const font = await requestRoute(vendor, '/synapse/vendor/katex/fonts/KaTeX_Main-Regular.woff2')
+  assert.equal(font.status, 200)
+  assert.equal(font.headers['content-type'], 'font/woff2')
+  assert.ok(font.body.length > 0)
+
+  // Anything outside the published whitelist must not be reachable, even when
+  // the file exists on disk (LICENSE, VERSION) or the URL tries to climb out.
+  for (const path of ['/synapse/vendor/katex/LICENSE', '/synapse/vendor/katex/../app.js',
+    '/synapse/vendor/katex/fonts/../../katex.min.js', '/synapse/vendor/katex/unknown.woff2']) {
+    const denied = await requestRoute(vendor, path)
+    assert.equal(denied.status, 404, path)
+  }
 })
 
 test('replays the sessions already live at mount through snapshotEvents()', async () => {

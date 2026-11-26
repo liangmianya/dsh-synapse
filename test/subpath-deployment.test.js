@@ -4,8 +4,11 @@ import { createServer } from 'node:http'
 import test from 'node:test'
 import vm from 'node:vm'
 
+// Page-referenced assets only: the fixture below serves exactly this map, so a
+// new <script>/<link> in page() fails the public-prefix check until it is here.
 const sources = Object.fromEntries(await Promise.all(
-  ['index.js', 'client.js', 'app.js', 'browser-cache.js', 'styles.css', 'deepseek-mark.svg']
+  ['index.js', 'client.js', 'app.js', 'browser-cache.js', 'math.js', 'styles.css', 'deepseek-mark.svg',
+    'vendor/katex/katex.min.js', 'vendor/katex/katex.min.css']
     .map(async name => [name, await readFile(new URL(`../${name}`, import.meta.url), 'utf8')]),
 ))
 const between = (source, start, end) => {
